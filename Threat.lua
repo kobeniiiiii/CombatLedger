@@ -3,18 +3,11 @@
 
     Primary path: this server answers a plain Blizzard addon message
     ("TWT_UDTSv4") with a reply over CHAT_MSG_ADDON (prefix "TWTv4=")
-    containing every group member's current threat against your target -
-    the same protocol TWThreat AND KLHThreatMeter both use, confirmed
-    (by reading both addons' actual source, including KLHThreatMeter's
-    dedicated KTM_TWT.lua) to need NOTHING beyond that one request - no
-    handshake, no registration message, nothing addon-specific. Despite
-    that, this addon alone never receives a reply unless TWThreat is
-    ALSO loaded, even though its own code has zero reply-construction
-    logic either (confirmed directly). Best remaining explanation: the
-    server gates replies on the client's real, automatically-reported
-    addon list (a standard vanilla protocol feature, unrelated to any
-    SendAddonMessage content) against a small allowlist of recognized
-    threat addons - not something spoofable from here.
+    containing group members' current threat against your target. This
+    is the same request/reply protocol TWThreat uses; it needs no addon
+    handshake or registration message. The request limit must stay in
+    TWThreat's supported range: TWThreat exposes 5-11 visible bars and
+    requests visibleBars - 1, so the largest valid request is 10.
 
     Fallback path: EstimateThreat() below computes threat locally from
     CombatLedger's own already-tracked damage/healing data, the same
@@ -37,7 +30,9 @@ local CL = CombatLedger
 local REQUEST_PREFIX = "TWT_UDTSv4"
 local REPLY_PREFIX = "TWTv4="
 local POLL_INTERVAL = 0.5 -- matches TWThreat's own polling cadence
-local REQUEST_LIMIT = 19
+-- TWThreat caps visibleBars at 11 and sends visibleBars - 1. Values above
+-- 10 can be silently ignored by the server, leaving only local estimates.
+local REQUEST_LIMIT = 10
 
 -- How long to wait after a poll with no real reply before estimating -
 -- generous enough that a real reply arriving just slightly late (server
@@ -58,12 +53,16 @@ local lastUpdate = 0
 
 -- ============================================================
 -- Local threat estimation (fallback when no real server reply arrives -
--- see this file's header comment for why that's needed at all). Ported
--- from GreedMeter's Threat.lua (same vanilla-classic threat-mechanic
--- approximations, values reused directly - this is public game-mechanic
--- data, not anything GreedMeter-specific), adapted to read from
--- CombatLedger's own Aggregator data instead of GreedMeter's meter
--- shape.
+-- see this file's header comment for why that's needed at all). This is
+-- deliberately owned entirely by Threat.lua: it reads Aggregator's
+-- already-existing per-target buckets, but never writes to them, so no
+-- Damage/Healing/History mode is changed by the estimator.
+--
+-- Nampower gives us target GUIDs for every damage event and exposes the
+-- spell DBC plus SPELL_GO. That is enough to keep the fallback scoped to
+-- the selected enemy and to account for explicit THREAT/THREAT_ALL spell
+-- effects (Sunder-style zero-damage threat) without guessing from combat
+-- text. It is still an estimate -- only a TWTv4 server reply is truth.
 -- ============================================================
 
 -- Class baseline threat-generation modifiers (relative, not absolute)
@@ -97,7 +96,35 @@ local SPELL_DAMAGE_THREAT_MULT = {
     ["Devastate"] = 1.50,
 }
 
-local function SpellDamageThreatMult(spell)
+-- Nampower mirrors the vanilla SpellEffect and SpellAttr enums. These
+-- constants are intentionally local to Threat mode; the normal meter
+-- pipeline has no reason to know about threat-only DBC details.
+local SPELL_EFFECT_THREAT = 63
+local SPELL_EFFECT_THREAT_ALL = 91
+local SPELL_ATTR_EX_NO_THREAT = 1024 -- 0x00000400
+
+local ZERO_GUID = "0x0000000000000000"
+
+local function ValidGuid(guid)
+    return guid and guid ~= "" and guid ~= ZERO_GUID and guid ~= "0x000000000"
+end
+
+local function SpellField(spellId, field)
+    if not spellId or not GetSpellRecField then return nil end
+    local ok, value = pcall(GetSpellRecField, spellId, field, 1)
+    if ok then return value end
+    return nil
+end
+
+local function SpellHasInitialDamageThreat(spellId)
+    if not spellId or spellId < 0 then return true end
+    local attributesEx = tonumber(SpellField(spellId, "attributesEx")) or 0
+    if CL.HasBit and CL.HasBit(attributesEx, SPELL_ATTR_EX_NO_THREAT) then return false end
+    return true
+end
+
+local function SpellDamageThreatMult(spell, spellId)
+    if not SpellHasInitialDamageThreat(spellId) then return 0 end
     if not spell or spell == "" then return 1.0 end
     local m = SPELL_DAMAGE_THREAT_MULT[spell]
     if m then return m end
@@ -110,54 +137,172 @@ local function SpellDamageThreatMult(spell)
     return 1.0
 end
 
--- Compute one player's estimated threat from their Aggregator unit
--- entry (damageDone/healingDone, already tracked for the meter itself -
--- no separate data collection needed). Healing counted at ~0.5x
--- effective heal, matching classic-era threat mechanics.
-local function EstimateUnitThreat(u)
+-- Threat that does not have a damage number (SPELL_EFFECT_THREAT and
+-- SPELL_EFFECT_THREAT_ALL) is kept here, completely separate from the
+-- Aggregator used by every other meter mode:
+--   [enemyGuid][rosterGuid] = threat delta
+local explicitThreat = {}
+local deadEnemies = {}
+local healingSeenTotals = {}
+
+local function AttributedGuid(guid)
+    if CL.GuidCache and CL.GuidCache.GetOwner then
+        local owner = CL.GuidCache.GetOwner(guid)
+        if owner then return owner end
+    end
+    return guid
+end
+
+local function IsTrackedGuid(guid)
+    return guid and CL.GuidCache and CL.GuidCache.IsTracked and CL.GuidCache.IsTracked(AttributedGuid(guid))
+end
+
+local function AddExplicitThreat(enemyGuid, actorGuid, amount)
+    enemyGuid = AttributedGuid(enemyGuid)
+    actorGuid = AttributedGuid(actorGuid)
+    amount = tonumber(amount) or 0
+    if not ValidGuid(enemyGuid) or not IsTrackedGuid(actorGuid) or amount == 0 then return end
+    local byActor = explicitThreat[enemyGuid]
+    if not byActor then
+        byActor = {}
+        explicitThreat[enemyGuid] = byActor
+    end
+    byActor[actorGuid] = math.max(0, (byActor[actorGuid] or 0) + amount)
+end
+
+-- Returns the target-specific and all-engaged-enemy threat encoded in a
+-- spell's DBC effects. EffectBasePoints is stored as value-1 in vanilla.
+local function ExplicitSpellThreat(spellId)
+    local effects = SpellField(spellId, "effect")
+    local basePoints = SpellField(spellId, "effectBasePoints")
+    if type(effects) ~= "table" or type(basePoints) ~= "table" then return 0, 0 end
+    local targetThreat, allThreat = 0, 0
+    local i
+    for i = 1, 3 do
+        local effect = tonumber(effects[i])
+        local amount = (tonumber(basePoints[i]) or -1) + 1
+        if effect == SPELL_EFFECT_THREAT then
+            targetThreat = targetThreat + amount
+        elseif effect == SPELL_EFFECT_THREAT_ALL then
+            allThreat = allThreat + amount
+        end
+    end
+    return targetThreat, allThreat
+end
+
+local function EnemyIsStillActive(guid)
+    if not ValidGuid(guid) or deadEnemies[guid] then return false end
+    -- A GUID may fall out of the client's live object map while still
+    -- engaged. Only exclude it when the API positively says it is dead.
+    if UnitIsDead then
+        local ok, isDead = pcall(UnitIsDead, guid)
+        if ok and isDead then return false end
+    end
+    return true
+end
+
+local function CollectActiveEnemies(enc, includeGuid)
+    local set = {}
+    local count = 0
+    if enc and enc.units then
+        local _, u
+        for _, u in pairs(enc.units) do
+            local targets = u.damageDone and u.damageDone.targets
+            if targets then
+                local targetGuid
+                for targetGuid in pairs(targets) do
+                    if not set[targetGuid] and not IsTrackedGuid(targetGuid) and EnemyIsStillActive(targetGuid) then
+                        set[targetGuid] = true
+                        count = count + 1
+                    end
+                end
+            end
+        end
+    end
+    if ValidGuid(includeGuid) and not set[includeGuid] and EnemyIsStillActive(includeGuid) then
+        set[includeGuid] = true
+        count = count + 1
+    end
+    return set, math.max(1, count)
+end
+
+-- Reconcile only healing that has not yet been assigned. This preserves
+-- the enemy set that was active when the healing happened instead of
+-- repeatedly dividing the encounter's entire healing total by whatever
+-- number of enemies happen to remain alive now.
+local function ReconcileHealingThreat(enc, enemies, enemyCount)
+    if not enc or not enc.units then return end
+    local guid, u
+    for guid, u in pairs(enc.units) do
+        local total = u.healingDone and (u.healingDone.total or 0) or 0
+        local seen = healingSeenTotals[guid] or 0
+        if total < seen then seen = 0 end -- defensive encounter-reset guard
+        local delta = total - seen
+        if delta > 0 then
+            local perEnemy = (delta * 0.5) / enemyCount
+            local enemyGuid
+            for enemyGuid in pairs(enemies) do
+                AddExplicitThreat(enemyGuid, guid, perEnemy)
+            end
+        end
+        healingSeenTotals[guid] = total
+    end
+end
+
+-- Compute one player's estimate against one enemy. Damage is read only
+-- from damageDone.targets[targetGuid], never from encounter-wide totals.
+-- Healing threat is shared across the enemies still active in this pull,
+-- matching vanilla's multi-mob healing-threat behavior as closely as the
+-- client-visible event stream permits.
+local function EstimateUnitThreat(u, guid, targetGuid)
     if not u then return 0 end
     local mod = 1.0
     if u.classToken and CLASS_THREAT_MOD[u.classToken] then
         mod = CLASS_THREAT_MOD[u.classToken]
     end
 
+    local targetBucket = u.damageDone and u.damageDone.targets and u.damageDone.targets[targetGuid]
     local dmgThreat = 0
-    if u.damageDone and u.damageDone.spells then
+    if targetBucket and targetBucket.spells then
         local spellId, entry
-        for spellId, entry in pairs(u.damageDone.spells) do
-            dmgThreat = dmgThreat + (entry.total or 0) * SpellDamageThreatMult(entry.name)
+        for spellId, entry in pairs(targetBucket.spells) do
+            dmgThreat = dmgThreat + (entry.total or 0) * SpellDamageThreatMult(entry.name, spellId)
         end
     end
-    -- Melee entries live outside .spells (see Aggregator.lua's
-    -- MeleeEntryFor) - fold in at the plain 1x rate.
-    if u.damageDone then
-        if u.damageDone.melee then dmgThreat = dmgThreat + (u.damageDone.melee.total or 0) end
-        if u.damageDone.offhand then dmgThreat = dmgThreat + (u.damageDone.offhand.total or 0) end
+    if targetBucket then
+        if targetBucket.melee then dmgThreat = dmgThreat + (targetBucket.melee.total or 0) end
+        if targetBucket.offhand then dmgThreat = dmgThreat + (targetBucket.offhand.total or 0) end
+        if targetBucket.petMelee then dmgThreat = dmgThreat + (targetBucket.petMelee.total or 0) end
+        if targetBucket.petOffhand then dmgThreat = dmgThreat + (targetBucket.petOffhand.total or 0) end
     end
 
-    local healThreat = 0
-    if u.healingDone then
-        healThreat = (u.healingDone.total or 0) * 0.5
-    end
-
-    return (dmgThreat + healThreat) * mod
+    local extra = explicitThreat[targetGuid] and explicitThreat[targetGuid][guid] or 0
+    return (dmgThreat + extra) * mod, targetBucket
 end
 
 -- Populates current/tankGuid from CombatLedger's own live encounter
 -- data (CL.Aggregator.GetCurrent().units) instead of a server reply.
 -- Same output shape HandleThreatPacket produces, so the UI needs no
 -- changes to consume either source.
-local function EstimateThreat()
+local function EstimateThreat(targetGuid)
+    if not ValidGuid(targetGuid) then return false end
     local enc = CL.Aggregator and CL.Aggregator.GetCurrent and CL.Aggregator.GetCurrent()
     if not enc or not enc.units then return false end
 
+    local activeEnemies, activeEnemyCount = CollectActiveEnemies(enc, targetGuid)
+    ReconcileHealingThreat(enc, activeEnemies, activeEnemyCount)
     local newCurrent = {}
     local maxThreat = 0
     local guid, u
     for guid, u in pairs(enc.units) do
-        local threat = EstimateUnitThreat(u)
+        local threat, targetBucket = EstimateUnitThreat(u, guid, targetGuid)
         if threat > 0 then
-            newCurrent[guid] = { name = u.name or guid, threat = threat, estimated = true }
+            local melee = targetBucket and (
+                (targetBucket.melee and (targetBucket.melee.total or 0) > 0) or
+                (targetBucket.offhand and (targetBucket.offhand.total or 0) > 0) or
+                (targetBucket.petMelee and (targetBucket.petMelee.total or 0) > 0) or
+                (targetBucket.petOffhand and (targetBucket.petOffhand.total or 0) > 0)) or false
+            newCurrent[guid] = { name = u.name or guid, threat = threat, estimated = true, melee = melee }
             if threat > maxThreat then maxThreat = threat end
         end
     end
@@ -168,7 +313,6 @@ local function EstimateThreat()
     local maxSeen = 0
     for guid, entry in pairs(newCurrent) do
         entry.perc = math.floor((entry.threat / maxThreat) * 100 + 0.5)
-        entry.melee = false
         entry.tank = false
         if entry.threat > maxSeen then
             maxSeen = entry.threat
@@ -181,7 +325,7 @@ local function EstimateThreat()
     tankGuid = newTank
 
     if CL.debug then
-        CL.LogLine("[Threat] estimated " .. CL.TableCount(newCurrent) .. " players (no real reply for " ..
+        CL.LogLine("[Threat] estimated target=" .. tostring(targetGuid) .. " " .. CL.TableCount(newCurrent) .. " players (no real reply for " ..
             string.format("%.1f", GetTime() - lastUpdate) .. "s)")
     end
 
@@ -306,9 +450,51 @@ end
 local function RequestThreat()
     local channel = GroupChannel()
     if not channel then return end
-    local ok, err = pcall(SendAddonMessage, REQUEST_PREFIX, "limit=" .. REQUEST_LIMIT, channel)
+    local requestBody = "limit=" .. REQUEST_LIMIT
+    local ok, err = pcall(SendAddonMessage, REQUEST_PREFIX, requestBody, channel)
     if CL.debug then
-        CL.LogLine("[Threat] request sent prefix=" .. REQUEST_PREFIX .. " channel=" .. channel .. " ok=" .. tostring(ok) .. (ok and "" or (" err=" .. tostring(err))))
+        CL.LogLine("[Threat] request sent prefix=" .. REQUEST_PREFIX ..
+            " body=" .. requestBody .. " channel=" .. channel .. " ok=" .. tostring(ok) ..
+            (ok and "" or (" err=" .. tostring(err))))
+    end
+end
+
+local function ThreatModeVisible()
+    return CL.UI and CL.UI.IsModeVisible and CL.UI.IsModeVisible("threat")
+end
+
+-- SPELL_GO is used only for explicit DBC threat effects, never for the
+-- damage already recorded by Aggregator. Keeping those two sources
+-- separate prevents the Threat implementation from double-counting or
+-- mutating Damage Done while still catching zero-damage threat spells.
+local function HandleThreatSpellGo(spellId, casterGuid, targetGuid, numTargetsHit)
+    if not ThreatModeVisible() or not IsTrackedGuid(casterGuid) then return end
+    spellId = tonumber(spellId)
+    if not spellId then return end
+
+    local targetThreat, allThreat = ExplicitSpellThreat(spellId)
+    if targetThreat == 0 and allThreat == 0 then return end
+
+    -- The SPELL_GO primary target is reliable for single-target spells.
+    -- If it is absent, use the live locked target as a best-effort target
+    -- only for this explicit effect; ordinary damage always has its own
+    -- authoritative target GUID in Aggregator.
+    if not ValidGuid(targetGuid) then
+        local ok, exists, liveTargetGuid = pcall(UnitExists, "target")
+        if ok and exists then targetGuid = liveTargetGuid end
+    end
+
+    if targetThreat ~= 0 and ValidGuid(targetGuid) and (tonumber(numTargetsHit) or 1) > 0 then
+        AddExplicitThreat(targetGuid, casterGuid, targetThreat)
+    end
+
+    if allThreat ~= 0 then
+        local enc = CL.Aggregator and CL.Aggregator.GetCurrent and CL.Aggregator.GetCurrent()
+        local enemies = CollectActiveEnemies(enc, targetGuid)
+        local enemyGuid
+        for enemyGuid in pairs(enemies) do
+            AddExplicitThreat(enemyGuid, casterGuid, allThreat)
+        end
     end
 end
 
@@ -317,8 +503,16 @@ f:RegisterEvent("CHAT_MSG_ADDON")
 f:RegisterEvent("PARTY_MEMBERS_CHANGED")
 f:RegisterEvent("RAID_ROSTER_UPDATE")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
+f:RegisterEvent("PLAYER_REGEN_DISABLED")
+f:RegisterEvent("PLAYER_REGEN_ENABLED")
+f:RegisterEvent("SPELL_GO_SELF")
+f:RegisterEvent("SPELL_GO_OTHER")
+f:RegisterEvent("UNIT_DIED")
 f:SetScript("OnEvent", function()
     if event == "PLAYER_ENTERING_WORLD" then
+        explicitThreat = {}
+        deadEnemies = {}
+        healingSeenTotals = {}
         RefreshRosterNames()
         return
     end
@@ -337,7 +531,30 @@ f:SetScript("OnEvent", function()
         end
         return
     end
-    RefreshRosterNames()
+    if event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
+        RefreshRosterNames()
+        return
+    end
+    if event == "PLAYER_REGEN_DISABLED" then
+        deadEnemies = {}
+        return
+    end
+    if event == "PLAYER_REGEN_ENABLED" then
+        explicitThreat = {}
+        deadEnemies = {}
+        healingSeenTotals = {}
+        return
+    end
+    if event == "UNIT_DIED" then
+        if arg1 then deadEnemies[arg1] = true end
+        return
+    end
+    if event == "SPELL_GO_SELF" or event == "SPELL_GO_OTHER" then
+        -- itemId, spellId, casterGuid, targetGuid, castFlags,
+        -- numTargetsHit, numTargetsMissed, corpseOwnerGuid
+        HandleThreatSpellGo(arg2, arg3, arg4, arg6)
+        return
+    end
 end)
 RefreshRosterNames()
 
@@ -406,7 +623,12 @@ f:SetScript("OnUpdate", function()
         -- fires when nothing real has landed recently, so a group that
         -- DOES get real replies never sees estimated numbers at all.
         if (GetTime() - lastUpdate) > ESTIMATE_GRACE then
-            EstimateThreat()
+            if EstimateThreat(targetGuid) then
+                -- A target-specific local snapshot is a valid response
+                -- for stale-display purposes. Do not clear and repopulate
+                -- it on the next line after STALE_TARGET_TIMEOUT.
+                pendingTargetSince = nil
+            end
         end
     elseif wasPolling then
         -- Target/combat state dropped since the last poll - clear

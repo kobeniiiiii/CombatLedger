@@ -137,6 +137,7 @@ local function BuildSortedList(units, mode)
         end
     end
     table.sort(list, function(a, b) return a.total > b.total end)
+
     return list
 end
 
@@ -193,6 +194,15 @@ local function BuildThreatList(filterSet)
         if t.name == playerName then playerMelee = t.melee end
     end
     table.sort(list, function(a, b) return a.total > b.total end)
+
+    -- Remember the real sorted rank before the display-only self pinning
+    -- in RefreshInstance potentially moves the player higher in the
+    -- visible list. The label must still say e.g. "15.", not pretend the
+    -- player became rank 4 merely because the window is short.
+    local rankIndex
+    for rankIndex = 1, table.getn(list) do
+        list[rankIndex].threatRank = rankIndex
+    end
 
     local marker = nil
     if tankThreat and tankThreat > 0 then
@@ -566,6 +576,42 @@ end
 local function FooterGap()
     if CL.GetSetting("lockWindow") then return 4 end
     return FOOTER_GAP
+end
+
+-- Threat is a fixed, non-scrollable snapshot like TWThreat: calculate how
+-- many complete rows fit in this particular window and, when the player's
+-- real rank falls below them, move that entry into the last visible real-
+-- player slot. Called only by Threat mode's RefreshInstance branch; every
+-- recorded meter mode keeps its normal sorted, scrollable list. threatRank
+-- preserves the player's real rank label after this display-only move.
+local function PinThreatPlayerToViewport(list, window, hasMarker)
+    if not list or not window then return 1 end
+
+    local step = CL.GetBarHeight(BAR_HEIGHT) + BAR_GAP
+    local viewportHeight = window:GetHeight() - HEADER_HEIGHT - FooterGap()
+    local visibleRows = math.floor((viewportHeight + BAR_GAP) / step)
+    if visibleRows < 1 then visibleRows = 1 end
+    if visibleRows > MAX_BARS then visibleRows = MAX_BARS end
+
+    local visiblePlayerRows = visibleRows - (hasMarker and 1 or 0)
+    if visiblePlayerRows < 1 then visiblePlayerRows = 1 end
+
+    local playerName = UnitName("player")
+    local playerIndex
+    local i
+    for i = 1, table.getn(list) do
+        if list[i].name == playerName then
+            playerIndex = i
+            break
+        end
+    end
+
+    if playerIndex and playerIndex > visiblePlayerRows then
+        local playerEntry = table.remove(list, playerIndex)
+        table.insert(list, visiblePlayerRows, playerEntry)
+    end
+
+    return visibleRows
 end
 
 -- How far the bar list can actually scroll. Deliberately NOT
@@ -1124,6 +1170,12 @@ local function CreateWindowFrame(inst)
 
     barScroll:EnableMouseWheel(true)
     barScroll:SetScript("OnMouseWheel", function()
+        -- Threat deliberately shows only what fits and pins the player
+        -- into that fixed snapshot; all recorded modes retain scrolling.
+        if f.mode == "threat" then
+            barScroll:SetVerticalScroll(0)
+            return
+        end
         local delta = arg1
         if not delta then return end
         local scrollStep = CL.GetBarHeight(BAR_HEIGHT) + BAR_GAP
@@ -1233,11 +1285,32 @@ RefreshInstance = function(inst)
         maxVal = list[1].total
     end
 
+    -- Display-only ordering adjustment for Threat mode. Do this after
+    -- maxVal is captured from the true #1 entry so pinning a low-threat
+    -- player into a very short viewport never changes bar scaling.
+    local threatVisibleRows
+    if isThreat then
+        threatVisibleRows = PinThreatPlayerToViewport(list, window, threatMarker ~= nil)
+        -- At an extreme one-row height, the player takes priority over
+        -- the reference marker so the always-visible promise still holds.
+        if threatVisibleRows <= 1 then threatMarker = nil end
+    end
+
     -- Pinned to the very top regardless of sort order - it's a
     -- reference line, not a real threat total, so it never competes for
     -- the #1 spot on its own (tiny) value.
     if threatMarker then
         table.insert(list, 1, threatMarker)
+    end
+
+    -- Threat has no scrolling: discard display entries below the fixed
+    -- viewport after self-pinning. BuildThreatList itself remains complete
+    -- for announcements and other non-display consumers.
+    if isThreat then
+        while table.getn(list) > threatVisibleRows do
+            table.remove(list)
+        end
+        window.barScroll:SetVerticalScroll(0)
     end
 
     local shown = 0
@@ -1274,9 +1347,19 @@ RefreshInstance = function(inst)
                 bar.valueText:SetText("+" .. FormatNumber(entry.total))
             elseif isThreat then
                 rank = rank + 1
-                local r, g, b = ClassColor(entry.classToken)
-                bar:SetStatusBarColor(r, g, b, 0.9)
-                bar.nameText:SetText(rank .. ". " .. (entry.tank and "|cffFFD100[T]|r " or "") .. entry.name)
+                -- TWThreat makes the player's own row solid red instead
+                -- of another class-colored bar, which is much easier to
+                -- find at a glance in a moving threat list. Keep this
+                -- unconditional treatment inside Threat mode only;
+                -- Damage/Healing/etc. retain their existing class colors
+                -- and optional user-configured self border below.
+                if entry.name == UnitName("player") then
+                    bar:SetStatusBarColor(1, 0.2, 0.2, 1)
+                else
+                    local r, g, b = ClassColor(entry.classToken)
+                    bar:SetStatusBarColor(r, g, b, 0.9)
+                end
+                bar.nameText:SetText((entry.threatRank or rank) .. ". " .. (entry.tank and "|cffFFD100[T]|r " or "") .. entry.name)
                 bar.valueText:SetText(FormatNumber(entry.total) .. "  (" .. (entry.perc or 0) .. "%)")
             else
                 rank = rank + 1
