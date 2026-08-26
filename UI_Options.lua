@@ -168,6 +168,16 @@ local function CreateWindow()
     -- own Character/Bags/Quest-dialog panels on this client, same as
     -- DIALOG did before that.
     f:SetFrameStrata("MEDIUM")
+    -- Without this, whichever CombatLedger window happened to get a
+    -- structurally higher frame level at creation time permanently
+    -- renders in front of every other "MEDIUM" window regardless of
+    -- which one was actually opened/clicked last - none of these
+    -- draggable windows called SetToplevel/Raise anywhere, so their
+    -- front-to-back order within the strata never changed after
+    -- creation. SetToplevel makes the engine auto-raise this frame
+    -- within its strata whenever it receives mouse focus, same as
+    -- Blizzard's own floating panels (CharacterFrame, etc).
+    f:SetToplevel(true)
     f:SetClampedToScreen(true)
     f:SetMovable(true)
     f:EnableMouse(true)

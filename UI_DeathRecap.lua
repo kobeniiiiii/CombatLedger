@@ -101,6 +101,11 @@ local function CreateWindow()
     -- own Character/Bags/Quest-dialog panels on this client, same as
     -- DIALOG did before that.
     f:SetFrameStrata("MEDIUM")
+    -- See UI_Options.lua's own comment on this - without it, whichever
+    -- window got a structurally higher frame level at creation time
+    -- permanently renders in front of every other "MEDIUM" window,
+    -- regardless of which was actually opened/clicked last.
+    f:SetToplevel(true)
     f:SetClampedToScreen(true)
     f:SetMovable(true)
     f:EnableMouse(true)

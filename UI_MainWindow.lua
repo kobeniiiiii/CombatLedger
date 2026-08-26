@@ -933,6 +933,13 @@ local function CreateWindowFrame(inst)
     -- reliably renders on top of this window regardless of which tier
     -- this window itself ends up at.
     f:SetFrameStrata("MEDIUM")
+    -- Without this, whichever CombatLedger window got a structurally
+    -- higher frame level at creation time permanently renders in front
+    -- of every other "MEDIUM" window regardless of which was actually
+    -- opened/clicked last - none of these windows called SetToplevel/
+    -- Raise anywhere, so their relative order within the strata never
+    -- changed after creation.
+    f:SetToplevel(true)
     f:SetClampedToScreen(true) -- can't be dragged/pushed off-screen, unlike before
     f:SetMovable(true)
     f:EnableMouse(true)

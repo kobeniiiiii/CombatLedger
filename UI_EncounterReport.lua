@@ -310,6 +310,11 @@ local function CreateWindow()
     f:SetBackdropColor(0, 0, 0, CL.GetBackdropAlpha(0.85))
     f:SetBackdropBorderColor(themeR, themeG, themeB, 1)
     f:SetFrameStrata("MEDIUM")
+    -- See UI_Options.lua's own comment on this - without it, whichever
+    -- window got a structurally higher frame level at creation time
+    -- permanently renders in front of every other "MEDIUM" window,
+    -- regardless of which was actually opened/clicked last.
+    f:SetToplevel(true)
     f:SetClampedToScreen(true)
     f:SetMovable(true)
     f:EnableMouse(true)
