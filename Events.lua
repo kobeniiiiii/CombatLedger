@@ -373,8 +373,16 @@ local function FinishEncounter()
 
     -- Skip saving near-nothing encounters (a stray hit that barely
     -- registered before the idle timeout) - not worth a history slot.
+    -- Boss fights (see Aggregator's isBossFight) go into their own
+    -- per-boss-name bucket instead of the regular capped list, so they
+    -- can't get pushed out by a busy trash-clearing session - see
+    -- History.lua's SaveBossEncounter.
     if finished.duration > 1 and CL.TableCount(finished.units) > 0 and CL.History then
-        CL.History.SaveEncounter(finished)
+        if finished.isBossFight and CL.History.SaveBossEncounter then
+            CL.History.SaveBossEncounter(finished)
+        else
+            CL.History.SaveEncounter(finished)
+        end
     end
 
     -- FinishEncounter also fires from the idle-timeout fallback (no
@@ -739,6 +747,38 @@ local function PrintStatus()
 end
 
 SLASH_COMBATLEDGER1 = "/cl"
+-- Manual reclassification: moves a plain-history encounter into the
+-- Bosses bucket (see History.lua's SaveBossEncounter) by hand. Exists
+-- for two real cases, not just testing: (1) a fight saved BEFORE the
+-- Bosses feature existed, which can never retroactively gain isBossFight
+-- on its own, and (2) IsBossTaggedEnemy's worldboss/elite-with-no-level
+-- heuristic missing some private-server-specific mob that's a real boss
+-- in-game but doesn't classify as one. Substring match against the saved
+-- label (case-insensitive, since msg already arrives lowercased below),
+-- not an exact match or index number - easier to type correctly than
+-- counting rows in the history window. Can't retroactively invent
+-- abilitySeries data that was never recorded live (see UI_EncounterReport's
+-- own comment on this) - the Abilities graph just stays empty for a fight
+-- tagged this way.
+local function TagHistoryEncounterAsBoss(query)
+    if not CL.History then return end
+    local hist = CL.History.GetHistory()
+    local i
+    for i = 1, table.getn(hist) do
+        local entry = hist[i]
+        local label = entry.label or ""
+        if string.find(string.lower(label), query, 1, true) then
+            CL.History.DeleteEncounter(i)
+            entry.isBossFight = true
+            CL.History.SaveBossEncounter(entry)
+            CL.Print("Tagged \"" .. label .. "\" as a boss kill - see /cl history's Bosses tab.")
+            if CL.UIHistory and CL.UIHistory.Refresh then CL.UIHistory.Refresh() end
+            return
+        end
+    end
+    CL.Print("No saved encounter matching \"" .. query .. "\" found in History.")
+end
+
 SlashCmdList["COMBATLEDGER"] = function(msg)
     msg = string.lower(msg or "")
     if msg == "debug" then
@@ -777,6 +817,13 @@ SlashCmdList["COMBATLEDGER"] = function(msg)
         end
     elseif msg == "options" or msg == "opt" then
         if CL.UIOptions then CL.UIOptions.Toggle() end
+    elseif string.find(msg, "^tagboss ") then
+        local query = string.sub(msg, string.len("tagboss ") + 1)
+        if query == "" then
+            CL.Print("Usage: /cl tagboss <name or part of the saved encounter's label>")
+        else
+            TagHistoryEncounterAsBoss(query)
+        end
     elseif msg == "testdeath" then
         -- Snapshots whatever's currently in your rolling hit-history
         -- buffer and shows the recap, without touching the real death
@@ -788,7 +835,7 @@ SlashCmdList["COMBATLEDGER"] = function(msg)
             if CL.UIDeathRecap then CL.UIDeathRecap.Show(playerGuid) end
         end
     else
-        CL.Print("/cl toggle|show|hide - meter window. /cl options - lock/minimap/appearance settings. /cl history - saved encounters. /cl report - graph + leaderboard for the current/last fight. /cl testdeath - preview the death recap without dying. /cl debug - toggle event logging. /cl status - live encounter totals. /cl flush - force-write the debug log now.")
+        CL.Print("/cl toggle|show|hide - meter window. /cl options - lock/minimap/appearance settings. /cl history - saved encounters. /cl tagboss <name> - reclassify a saved encounter as a boss kill. /cl report - graph + leaderboard for the current/last fight. /cl testdeath - preview the death recap without dying. /cl debug - toggle event logging. /cl status - live encounter totals. /cl flush - force-write the debug log now.")
     end
 end
 

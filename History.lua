@@ -121,9 +121,79 @@ local function ClearHistory()
     CombatLedgerDB.encountersByChar[key] = {}
 end
 
+-- Boss kills get their OWN per-character bucket, keyed by boss name
+-- (encounter.label) - the regular list above is a single flat, capped
+-- (CL.MAX_ENCOUNTERS) most-recent-first list, so a busy trash-clearing
+-- session can push a boss kill out before anyone gets a chance to look
+-- at it. Keeping bosses separate, capped per-name instead of overall,
+-- means killing Boss A ten times can never evict Boss B's saved kills.
+local BOSS_KILLS_PER_BOSS = 10
+
+local function EnsureBossTable()
+    if not CombatLedgerDB.bossEncountersByChar then
+        CombatLedgerDB.bossEncountersByChar = {}
+    end
+    local key = CharKey()
+    if not CombatLedgerDB.bossEncountersByChar[key] then
+        CombatLedgerDB.bossEncountersByChar[key] = {}
+    end
+    return key
+end
+
+local function SaveBossEncounter(encounter)
+    if not encounter then return end
+    local key = EnsureBossTable()
+    local bosses = CombatLedgerDB.bossEncountersByChar[key]
+
+    if not encounter.label then
+        encounter.label = ComputeLabel(encounter)
+    end
+    encounter.mobTally = nil
+    encounter.mobHealth = nil
+
+    local name = encounter.label
+    if not bosses[name] then bosses[name] = {} end
+    local list = bosses[name]
+    table.insert(list, 1, encounter)
+    while table.getn(list) > BOSS_KILLS_PER_BOSS do
+        table.remove(list, table.getn(list))
+    end
+end
+
+-- [bossName] = { encounter, encounter, ... } - most-recent-first, same
+-- shape as GetHistory's list but one level deeper (grouped by name).
+local function GetBossHistory()
+    local key = EnsureBossTable()
+    return CombatLedgerDB.bossEncountersByChar[key]
+end
+
+local function DeleteBossEncounter(bossName, index)
+    local key = EnsureBossTable()
+    local list = CombatLedgerDB.bossEncountersByChar[key][bossName]
+    if not list then return end
+    table.remove(list, index)
+    if table.getn(list) == 0 then
+        CombatLedgerDB.bossEncountersByChar[key][bossName] = nil
+    end
+end
+
+-- No bossName clears everything; a specific name clears just that boss.
+local function ClearBossHistory(bossName)
+    local key = EnsureBossTable()
+    if bossName then
+        CombatLedgerDB.bossEncountersByChar[key][bossName] = nil
+    else
+        CombatLedgerDB.bossEncountersByChar[key] = {}
+    end
+end
+
 CL.History = {
     SaveEncounter = SaveEncounter,
     GetHistory = GetHistory,
     DeleteEncounter = DeleteEncounter,
     ClearHistory = ClearHistory,
+    SaveBossEncounter = SaveBossEncounter,
+    GetBossHistory = GetBossHistory,
+    DeleteBossEncounter = DeleteBossEncounter,
+    ClearBossHistory = ClearBossHistory,
 }

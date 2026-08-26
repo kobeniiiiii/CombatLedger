@@ -49,18 +49,18 @@ local REFRESH_INTERVAL = 0.2
 
 -- "Buffs Given" was built (same mechanism as Debuffs) but is hidden -
 -- see Aggregator.lua/UI_MainWindow's own note.
-local MODE_TITLES = { damage = "Damage Done", healing = "Healing Done", taken = "Damage Taken", cleanses = "Dispels", debuffs = "Debuffs Given", deaths = "Deaths" }
+local MODE_TITLES = { damage = "Damage Done", healing = "Healing Done", taken = "Damage Taken", cleanses = "Dispels", debuffs = "Debuffs Given", interrupts = "Interrupts", deaths = "Deaths" }
 
--- Cleanses/Debuffs are counts, not amounts - see UI_MainWindow's own
--- copy of this set for why.
-local COUNT_ONLY_MODES = { cleanses = true, debuffs = true }
+-- Cleanses/Debuffs/Interrupts are counts, not amounts - see
+-- UI_MainWindow's own copy of this set for why.
+local COUNT_ONLY_MODES = { cleanses = true, debuffs = true, interrupts = true }
 
 -- Every mode with a per-ability breakdown also gets a per-target/
 -- recipient/attacker list, same underlying mechanism (see Aggregator.lua's
 -- damageDone.targets / healingDone.targets / damageTaken.targets), just
 -- different wording for what the "other end" of the number represents.
-local MODE_TARGET_LABEL = { damage = "Targets", healing = "Healed", taken = "Attackers", cleanses = "Dispelled", debuffs = "Given To" }
-local MODE_ALL_LABEL = { damage = "All Enemies", healing = "Everyone", taken = "All Attackers", cleanses = "Everyone", debuffs = "Everyone" }
+local MODE_TARGET_LABEL = { damage = "Targets", healing = "Healed", taken = "Attackers", cleanses = "Dispelled", debuffs = "Given To", interrupts = "Interrupted" }
+local MODE_ALL_LABEL = { damage = "All Enemies", healing = "Everyone", taken = "All Attackers", cleanses = "Everyone", debuffs = "Everyone", interrupts = "Everyone" }
 
 local function ModeBucket(u, mode)
     if not u then return nil end
@@ -68,6 +68,7 @@ local function ModeBucket(u, mode)
     if mode == "taken" then return u.damageTaken end
     if mode == "cleanses" then return u.cleanses end
     if mode == "debuffs" then return u.debuffsGiven end
+    if mode == "interrupts" then return u.interrupts end
     -- Deaths is a plain counter (u.deaths), not a spell/target bucket -
     -- deliberately no case here, since falling through to u.damageDone
     -- would show the player's own damage breakdown while labeled
@@ -99,6 +100,11 @@ local currentClassToken = nil
 local selectedKey = nil -- stable id (see BuildSpellList) for whichever ability the detail panel shows
 local selectedTargetGuid = nil -- click a target row to filter the ability list to just what hit them
 local lastTargetCount = -1 -- only re-layout the left column when this actually changes (see BD.Refresh)
+-- Scroll offsets live on the window frame itself (window.barScrollOffset/
+-- targetScrollOffset), NOT as their own module locals - BD.Refresh already
+-- sits right at this client's Lua 5.0 upvalue limit (32 per function), and
+-- reusing the `window` upvalue it already needs costs nothing further,
+-- where two more standalone locals would tip it over ("too many upvalues").
 
 -- One shared breakdown popup regardless of how many meter windows are
 -- open - clicking a bar in any of them opens this same window, so it
@@ -459,6 +465,22 @@ local function CreateWindow()
         targetBars[i] = CreateTargetBar(targetParent, i)
     end
 
+    -- Targets list is a fixed MAX_TARGET_BARS-row window into however
+    -- many real targets there actually are (Overall mode never resets on
+    -- its own and can easily rack up hundreds) - mouse wheel pages
+    -- through them rather than hard-capping at the first few forever.
+    -- "All Enemies" itself (a separate bar, not part of this pool) always
+    -- stays pinned regardless of scroll position.
+    f.targetScrollOffset = 0
+    targetParent:EnableMouseWheel(true)
+    targetParent:SetScript("OnMouseWheel", function()
+        local delta = arg1
+        if not delta then return end
+        if delta > 0 then f.targetScrollOffset = f.targetScrollOffset - 1 else f.targetScrollOffset = f.targetScrollOffset + 1 end
+        if f.targetScrollOffset < 0 then f.targetScrollOffset = 0 end
+        BD.Refresh()
+    end)
+
     local allEnemiesBar = CreateAllEnemiesBar(targetParent)
     f.allEnemiesBar = allEnemiesBar
 
@@ -473,6 +495,21 @@ local function CreateWindow()
     for i = 1, MAX_BARS do
         bars[i] = CreateBar(barParent, i)
     end
+
+    -- Ability list is a window (however many rows actually fit the
+    -- current window height - see BD.Refresh's `fit` calc) into however
+    -- many abilities there really are, up to MAX_BARS - mouse wheel pages
+    -- through the rest instead of requiring the window be resized tall
+    -- enough to fit everything at once.
+    f.barScrollOffset = 0
+    barParent:EnableMouseWheel(true)
+    barParent:SetScript("OnMouseWheel", function()
+        local delta = arg1
+        if not delta then return end
+        if delta > 0 then f.barScrollOffset = f.barScrollOffset - 1 else f.barScrollOffset = f.barScrollOffset + 1 end
+        if f.barScrollOffset < 0 then f.barScrollOffset = 0 end
+        BD.Refresh()
+    end)
 
     -- Sizes the Targets area to however many target rows there actually
     -- are (0 if none/not damage mode) instead of always reserving room
@@ -869,8 +906,27 @@ function BD.Refresh()
     -- actually are so it doesn't eat into the ability list's space when
     -- there's only one or two. Deaths mode has no per-target breakdown.
     local targets = (mode ~= "deaths") and BuildTargetList(u, mode) or {}
-    local targetCount = table.getn(targets)
+    local realTargetCount = table.getn(targets)
+    local targetCount = realTargetCount
     if targetCount > MAX_TARGET_BARS then targetCount = MAX_TARGET_BARS end
+
+    -- Mouse-wheel window into `targets` (Overall mode never resets on its
+    -- own and can rack up hundreds) - the box itself stays a fixed
+    -- MAX_TARGET_BARS-row size (targetCount above, used for layout,
+    -- always caps there); this only controls which MAX_TARGET_BARS-sized
+    -- slice of the real list currently fills it.
+    -- Copied out of window.targetScrollOffset (see that field's own
+    -- comment near the top of the file for why it isn't a module local)
+    -- into a plain local for the rest of this function - local reads/
+    -- writes don't count against Lua's per-function upvalue limit the
+    -- way capturing another new outer-scope variable would.
+    local targetScrollOffset = window.targetScrollOffset or 0
+    local maxTargetOffset = realTargetCount - MAX_TARGET_BARS
+    if maxTargetOffset < 0 then maxTargetOffset = 0 end
+    if targetScrollOffset > maxTargetOffset then targetScrollOffset = maxTargetOffset end
+    if targetScrollOffset < 0 then targetScrollOffset = 0 end
+    window.targetScrollOffset = targetScrollOffset
+
     -- Only actually re-anchor when the count changes, not every refresh
     -- (5x/second otherwise) - this client doesn't reliably redraw a
     -- frame's backdrop/bounds after ClearAllPoints()+SetPoint() unless
@@ -939,15 +995,37 @@ function BD.Refresh()
     if fit < 1 then fit = 1 end
     if fit > MAX_BARS then fit = MAX_BARS end
 
-    local realCount = table.getn(list)
-    if realCount > fit then realCount = fit end
+    -- Mouse-wheel window into `list` - see targetScrollOffset's own
+    -- comment above for why this is copied out of window.barScrollOffset
+    -- into a plain local rather than its own module-level upvalue.
+    -- Clamped here (not just floored at 0 in the wheel handler) since
+    -- `fit`/list length can change out from under a stale offset (window
+    -- resized, mode switched to one with fewer abilities, etc).
+    local barScrollOffset = window.barScrollOffset or 0
+    local listLen = table.getn(list)
+    local maxBarOffset = listLen - fit
+    if maxBarOffset < 0 then maxBarOffset = 0 end
+    if barScrollOffset > maxBarOffset then barScrollOffset = maxBarOffset end
+    if barScrollOffset < 0 then barScrollOffset = 0 end
+    window.barScrollOffset = barScrollOffset
+
+    -- Found across the FULL list, not just the currently visible window -
+    -- scrolling away from a selected ability shouldn't blank out its
+    -- persistent detail panel on the right.
+    local selectedEntry = nil
+    local si
+    for si = 1, listLen do
+        if list[si].key == selectedKey then
+            selectedEntry = list[si]
+            break
+        end
+    end
 
     local shown = 0
-    local selectedEntry = nil
     local i
     for i = 1, MAX_BARS do
         local bar = bars[i]
-        local entry = (i <= realCount) and list[i] or nil
+        local entry = (i <= fit) and list[i + barScrollOffset] or nil
         if entry then
             shown = shown + 1
             local pct = entry.total / maxVal
@@ -955,9 +1033,7 @@ function BD.Refresh()
             bar:SetValue(pct)
             local col = ROW_COLORS[math.mod(i - 1, table.getn(ROW_COLORS)) + 1]
             bar:SetStatusBarColor(col[1], col[2], col[3], 0.9)
-            local isSelected = (entry.key == selectedKey)
-            if isSelected then
-                selectedEntry = entry
+            if entry.key == selectedKey then
                 bar.nameText:SetTextColor(themeR, themeG, themeB)
             else
                 bar.nameText:SetTextColor(1, 1, 1)
@@ -1006,9 +1082,11 @@ function BD.Refresh()
         filteredTarget and filteredTarget.name)
 
     -- "All Enemies" sits at slot 1 (once there's more than one target to
-    -- pick from), bumping the actual target rows down one slot and one
-    -- number so the whole Targets list reads as a single numbered list.
-    local showAllEnemies = targetCount > 1
+    -- pick from - realTargetCount, not the page-capped targetCount, so it
+    -- stays available even while scrolled deep into a long target list),
+    -- bumping the actual target rows down one slot and one number so the
+    -- whole Targets list reads as a single numbered list.
+    local showAllEnemies = realTargetCount > 1
     local slotSize = TARGET_BAR_HEIGHT + TARGET_BAR_GAP
     local shift = showAllEnemies and 1 or 0
 
@@ -1031,13 +1109,13 @@ function BD.Refresh()
 
     for i = 1, MAX_TARGET_BARS do
         local tbar = targetBars[i]
-        local t = (i <= targetCount) and targets[i] or nil
+        local t = targets[i + targetScrollOffset]
         if t then
             local slot = (i - 1) + shift
             tbar:ClearAllPoints()
             tbar:SetPoint("TOPLEFT", window.targetParent, "TOPLEFT", 0, -(slot * slotSize))
             tbar:SetPoint("TOPRIGHT", window.targetParent, "TOPRIGHT", 0, -(slot * slotSize))
-            tbar.nameText:SetText((i + shift) .. ". " .. t.name)
+            tbar.nameText:SetText((i + shift + targetScrollOffset) .. ". " .. t.name)
             tbar.valueText:SetText(FormatNumber(t.total))
             if t.guid == selectedTargetGuid then
                 tbar.nameText:SetTextColor(themeR, themeG, themeB)
@@ -1109,6 +1187,8 @@ function BD.Show(guid, mode, segment, historyEncounter)
     selectedTargetGuid = nil
     lastTargetCount = -1
     if not window then CreateWindow() end
+    window.barScrollOffset = 0
+    window.targetScrollOffset = 0
     window:Show()
     BD.Refresh()
 end

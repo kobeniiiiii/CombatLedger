@@ -61,6 +61,22 @@ local function NewEncounter()
         -- event log could - only the live DeathRecap buffer keeps that
         -- level of per-event detail, and only for the last 10s per unit.
         series = {},
+        -- Set true the moment this encounter's enemy is confirmed
+        -- boss-tagged (see IsBossTaggedEnemy) - drives both which History
+        -- bucket the finished encounter gets saved into (History.lua's
+        -- separate per-boss-name bucket, not the regular capped list -
+        -- see SaveBossEncounter) and whether abilitySeries below gets
+        -- populated at all.
+        isBossFight = false,
+        -- Raid-wide damage-by-ability-per-second, ONLY collected for boss
+        -- fights (see RecordAbilitySeriesPoint) - a real per-encounter
+        -- feature (History's Bosses tab report graphs "each ability as
+        -- its own line"), not something worth the memory/CPU cost for
+        -- every random trash pull the way `series` above already is.
+        -- [bucketIdx] = { [spellKey] = amount } - one bucket per second.
+        abilitySeries = {},
+        abilityNames = {}, -- [spellKey] = display name, for the graph legend
+        abilityTotals = {}, -- [spellKey] = grand total across the whole fight, for ranking/top-N selection
     }
 end
 
@@ -80,6 +96,40 @@ local function RecordSeriesPoint(enc, kind, amount)
         enc.series[idx] = bucket
     end
     bucket[kind] = (bucket[kind] or 0) + amount
+end
+
+-- Melee/off-hand have no spellId to key by - reuses this file's existing
+-- convention (see Threat.lua's REFLECT_SPELL_ID) of a negative sentinel
+-- standing in for "not a real spellId" instead of colliding with one.
+local MELEE_ABILITY_KEY = -1
+local OFFHAND_ABILITY_KEY = -2
+
+-- 1s resolution (finer than the 2s TIMELINE_BUCKET_SECONDS above) - "by
+-- second" was explicit in the ask, and this only ever runs for boss
+-- fights (a handful of saved kills, not every trash pull), so the extra
+-- granularity doesn't carry the same bloat risk `series` was built to
+-- avoid. UI_EncounterReport.lua downsamples for display the same way it
+-- already downsamples `series`, so the render cost stays flat regardless
+-- of fight length.
+local ABILITY_BUCKET_SECONDS = 1
+
+local function RecordAbilitySeriesPoint(enc, spellKey, spellName, amount)
+    if not enc or not enc.isBossFight or not enc.startTime then return end
+    if not enc.abilitySeries then enc.abilitySeries = {} end
+    if not enc.abilityNames then enc.abilityNames = {} end
+    if not enc.abilityTotals then enc.abilityTotals = {} end
+
+    local elapsed = GetTime() - enc.startTime
+    local idx = math.floor(elapsed / ABILITY_BUCKET_SECONDS) + 1
+    if idx < 1 then idx = 1 end
+    local bucket = enc.abilitySeries[idx]
+    if not bucket then
+        bucket = {}
+        enc.abilitySeries[idx] = bucket
+    end
+    bucket[spellKey] = (bucket[spellKey] or 0) + amount
+    enc.abilityNames[spellKey] = spellName
+    enc.abilityTotals[spellKey] = (enc.abilityTotals[spellKey] or 0) + amount
 end
 
 local overall = NewEncounter() -- long-lived; only cleared by ResetOverall()
@@ -679,11 +729,29 @@ local function RecordDamage(casterGuid, targetGuid, spellId, spellName, school, 
     -- once. Stays nil (and keeps re-checking each call) until a
     -- boss-tagged hit actually happens, so a trash-only encounter never
     -- claims this and never prints - see CL.GetSetting("announcePulls").
-    if not current.pullBy and casterGuid and IsBossTaggedEnemy(EnemyGuidFor(casterGuid, targetGuid)) then
-        local info = CL.GuidCache and CL.GuidCache.Resolve(casterGuid)
-        current.pullBy = { name = (info and info.name) or casterGuid, label = spellName or "Auto Attack" }
-        if CL.GetSetting("announcePulls") ~= false then
-            CL.Print("Pull: " .. current.pullBy.name .. " (" .. current.pullBy.label .. ")")
+    --
+    -- Skipped entirely once BOTH isBossFight and pullBy are already
+    -- settled - IsBossTaggedEnemy does a real UnitClassification pcall,
+    -- not worth paying on every single damage event for the rest of a
+    -- multi-minute boss fight once neither answer can change anymore
+    -- (isBossFight only ever goes false->true; pullBy is "once ever").
+    -- Kept as an OR (not just "not isBossFight") so the rare case of the
+    -- very first boss-tagged hit having no resolvable casterGuid doesn't
+    -- permanently strand pullBy at nil - later calls keep checking until
+    -- a boss-tagged hit with a real caster shows up too. A boss that
+    -- joins a fight already in progress (an add, a phase transition) is
+    -- caught the same way, for the same reason.
+    if not current.isBossFight or not current.pullBy then
+        local isBossHit = IsBossTaggedEnemy(EnemyGuidFor(casterGuid, targetGuid))
+        if isBossHit then
+            current.isBossFight = true
+            if not current.pullBy and casterGuid then
+                local info = CL.GuidCache and CL.GuidCache.Resolve(casterGuid)
+                current.pullBy = { name = (info and info.name) or casterGuid, label = spellName or "Auto Attack" }
+                if CL.GetSetting("announcePulls") ~= false then
+                    CL.Print("Pull: " .. current.pullBy.name .. " (" .. current.pullBy.label .. ")")
+                end
+            end
         end
     end
 
@@ -692,6 +760,11 @@ local function RecordDamage(casterGuid, targetGuid, spellId, spellName, school, 
 
     if casterGuid and IsTrackedGuid(AttributedGuid(casterGuid)) then
         RecordSeriesPoint(current, "damage", amount)
+        if current.isBossFight then
+            local abilityKey = spellId or (isOffhand and OFFHAND_ABILITY_KEY or MELEE_ABILITY_KEY)
+            local abilityName = spellName or (isOffhand and "Off-Hand" or "Auto Attack")
+            RecordAbilitySeriesPoint(current, abilityKey, abilityName, amount)
+        end
     end
     if targetGuid and IsTrackedGuid(AttributedGuid(targetGuid)) then
         RecordSeriesPoint(current, "taken", amount)
@@ -1098,6 +1171,7 @@ local function GenerateTestEncounter()
         FakeDamageTaken(u, r.power)
         FakeCleanses(u, r.power)
         FakeDebuffsGiven(u, r.power)
+        FakeInterrupts(u, r.power)
     end
     enc.units["TESTUNIT7"].deaths = 1 -- Adolin - one fake death, for previewing Deaths mode
     return enc
@@ -1116,6 +1190,7 @@ end
 
 CL.Aggregator = {
     SERIES_BUCKET_SECONDS = TIMELINE_BUCKET_SECONDS,
+    ABILITY_BUCKET_SECONDS = ABILITY_BUCKET_SECONDS,
     StartEncounter = StartEncounter,
     EndEncounter = EndEncounter,
     GetCurrent = GetCurrent,

@@ -27,6 +27,13 @@ local BAR_GAP = 2
 local HEADER_HEIGHT = 28 -- a few extra px of breathing room below the button row before the first bar
 local FOOTER_GAP = 12
 
+-- Caps the hover tooltip's "By target:"/"By spell:" lists (see
+-- ShowBarTooltip) - Overall mode never resets on its own and can rack up
+-- a target list running well past screen height over a long session,
+-- pushing the spell breakdown off-screen entirely. Full uncapped detail
+-- is still one click away via the Breakdown window.
+local TOOLTIP_TARGET_LIST_CAP = 5
+
 local WINDOW_WIDTH, WINDOW_HEIGHT = 220, 260
 local MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT = 160, 100
 local MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT = 500, 600
@@ -43,14 +50,14 @@ local REFRESH_INTERVAL = 0.2
 -- Threat.lua) with no Current/Overall/History distinction, so it gets
 -- its own code path through RefreshInstance/ShowBarTooltip below rather
 -- than flowing through GetActiveEncounter like everything else.
-local MODE_ORDER = { "damage", "healing", "taken", "cleanses", "debuffs", "deaths", "threat" }
-local MODE_TITLES = { damage = "Damage Done", healing = "Healing Done", taken = "Damage Taken", cleanses = "Dispels", debuffs = "Debuffs Given", deaths = "Deaths", threat = "Threat" }
+local MODE_ORDER = { "damage", "healing", "taken", "cleanses", "debuffs", "interrupts", "deaths", "threat" }
+local MODE_TITLES = { damage = "Damage Done", healing = "Healing Done", taken = "Damage Taken", cleanses = "Dispels", debuffs = "Debuffs Given", interrupts = "Interrupts", deaths = "Deaths", threat = "Threat" }
 
--- Cleanses/Debuffs are counts, not amounts - no meaningful "rate" or
--- "crit %" the way damage/healing have, so bars/tooltips/announce show
--- a plain count for these instead.
-local COUNT_ONLY_MODES = { cleanses = true, debuffs = true }
-local COUNT_WORD = { cleanses = "dispel", debuffs = "debuff" }
+-- Cleanses/Debuffs/Interrupts are counts, not amounts - no meaningful
+-- "rate" or "crit %" the way damage/healing have, so bars/tooltips/
+-- announce show a plain count for these instead.
+local COUNT_ONLY_MODES = { cleanses = true, debuffs = true, interrupts = true }
+local COUNT_WORD = { cleanses = "dispel", debuffs = "debuff", interrupts = "interrupt" }
 
 local function CountLabel(mode, n)
     local word = COUNT_WORD[mode] or "event"
@@ -112,6 +119,8 @@ local function MetricTotal(u, mode)
         return (u.cleanses and u.cleanses.total) or 0
     elseif mode == "debuffs" then
         return (u.debuffsGiven and u.debuffsGiven.total) or 0
+    elseif mode == "interrupts" then
+        return (u.interrupts and u.interrupts.total) or 0
     elseif mode == "deaths" then
         return u.deaths or 0
     end
@@ -214,6 +223,8 @@ local function BuildSpellSummary(u, mode)
         bucket = u.cleanses
     elseif mode == "debuffs" then
         bucket = u.debuffsGiven
+    elseif mode == "interrupts" then
+        bucket = u.interrupts
     else
         bucket = u.damageDone
     end
@@ -254,6 +265,8 @@ local function BuildTargetSummary(u, mode)
         bucket = u and u.cleanses
     elseif mode == "debuffs" then
         bucket = u and u.debuffsGiven
+    elseif mode == "interrupts" then
+        bucket = u and u.interrupts
     else
         bucket = u and u.damageDone
     end
@@ -416,8 +429,23 @@ local function ShowBarTooltip(inst, bar)
             GameTooltip:AddLine(" ")
             GameTooltip:AddLine("By target:", 1, 0.82, 0)
             local i
-            for i = 1, table.getn(targets) do
+            local shown = table.getn(targets)
+            if shown > TOOLTIP_TARGET_LIST_CAP then shown = TOOLTIP_TARGET_LIST_CAP end
+            for i = 1, shown do
                 GameTooltip:AddDoubleLine(targets[i].name, FormatNumber(targets[i].total), 0.9, 0.9, 0.9, 1, 1, 1)
+            end
+            -- Overall never resets on its own (only /cl reset or the
+            -- clear-on-join option) - after a long session it can rack up
+            -- a target list running well past screen height, which used
+            -- to push the "By spell:" section (usually the more useful
+            -- half) off-screen entirely. Sorted descending already (see
+            -- BuildTargetSummary), so capping never hides the biggest
+            -- entries - only a "+N more" summary line for the tail. Spells
+            -- stay uncapped - that list is naturally short and is the
+            -- part actually worth seeing at a glance.
+            local remaining = table.getn(targets) - shown
+            if remaining > 0 then
+                GameTooltip:AddLine("+" .. remaining .. " more - click for full breakdown", 0.6, 0.6, 0.6)
             end
         end
     end
@@ -1060,7 +1088,7 @@ local function CreateWindowFrame(inst)
         end
         CL.ShowDropdown(modeBtn, options)
     end)
-    SetButtonTooltip(modeBtn, "Mode", "Damage Done / Healing Done / Damage Taken / Deaths / Threat", themeR, themeG, themeB)
+    SetButtonTooltip(modeBtn, "Mode", "Damage Done / Healing Done / Damage Taken / Dispels / Debuffs / Interrupts / Deaths / Threat", themeR, themeG, themeB)
     CL.ApplyButtonSkin(modeBtn, themeR, themeG, themeB)
     f.modeBtn = modeBtn
 

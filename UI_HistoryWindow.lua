@@ -13,7 +13,8 @@ CL.UIHistory = HW
 
 local ROW_HEIGHT = 34
 local ROW_GAP = 3
-local HEADER_HEIGHT = 46
+local TAB_HEIGHT = 18
+local HEADER_HEIGHT = 64
 local FOOTER_GAP = 12
 
 local WINDOW_WIDTH, WINDOW_HEIGHT = 260, 320
@@ -25,11 +26,43 @@ local rows = {}
 local MAX_ROWS = 20
 local scrollOffset = 0
 
+-- "history" (the regular flat capped list) or "bosses" (grouped by boss
+-- name, capped per-name instead - see History.lua's SaveBossEncounter).
+local activeTab = "history"
+
 local function FormatTimeAgo(seconds)
     if seconds < 60 then return "just now" end
     if seconds < 3600 then return math.floor(seconds / 60) .. "m ago" end
     if seconds < 86400 then return math.floor(seconds / 3600) .. "h ago" end
     return math.floor(seconds / 86400) .. "d ago"
+end
+
+-- Flattens CL.History.GetBossHistory()'s {[bossName] = {kills...}} shape
+-- into one sorted, displayable list - alphabetical by boss name so a
+-- boss's own kills stay grouped together, most-recent-first within each
+-- name (matching the regular tab's own ordering). Each row carries both
+-- its bossName and its index WITHIN that boss's own list (not a flat
+-- index), since that's what DeleteBossEncounter needs.
+local function BuildBossRowList()
+    local bosses = CL.History.GetBossHistory()
+    local names = {}
+    local name
+    for name in pairs(bosses) do
+        table.insert(names, name)
+    end
+    table.sort(names)
+
+    local list = {}
+    local i, n
+    for i = 1, table.getn(names) do
+        n = names[i]
+        local kills = bosses[n]
+        local j
+        for j = 1, table.getn(kills) do
+            table.insert(list, { bossName = n, bossIndex = j, entry = kills[j] })
+        end
+    end
+    return list
 end
 
 local function CreateRow(parent, index)
@@ -71,7 +104,10 @@ local function CreateRow(parent, index)
     delTex:SetAllPoints(deleteBtn)
     delTex:SetTexture("Interface\\Buttons\\UI-StopButton")
     deleteBtn:SetScript("OnClick", function()
-        if row.encounterIndex then
+        if row.bossName then
+            CL.History.DeleteBossEncounter(row.bossName, row.bossIndex)
+            HW.Refresh()
+        elseif row.encounterIndex then
             CL.History.DeleteEncounter(row.encounterIndex)
             HW.Refresh()
         end
@@ -179,10 +215,46 @@ local function CreateWindow()
     closeBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
     closeBtn:SetScript("OnClick", function() f:Hide() end)
 
+    -- Two click-to-select tabs (same simple pattern UI_MainWindow.lua
+    -- uses for its own mode/segment buttons, rather than a dropdown) -
+    -- "History" is the regular flat capped list, "Bosses" is grouped by
+    -- boss name with its own per-name cap (see BuildBossRowList/
+    -- History.lua's SaveBossEncounter).
+    local function CreateTabButton(text, tab, xOff)
+        local btn = CreateFrame("Button", nil, f)
+        btn:SetWidth(58)
+        btn:SetHeight(TAB_HEIGHT)
+        btn:SetPoint("TOPLEFT", f, "TOPLEFT", xOff, -20)
+        btn:SetBackdrop({
+            bgFile = "Interface\\BUTTONS\\WHITE8X8", tile = false, tileSize = 0,
+            edgeFile = "Interface\\BUTTONS\\WHITE8X8", edgeSize = 1,
+            insets = { left = -1, right = -1, top = -1, bottom = -1 },
+        })
+        btn:SetBackdropColor(0.15, 0.15, 0.15, 0.75)
+        btn:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+        local label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        label:SetAllPoints(btn)
+        label:SetJustifyH("CENTER")
+        label:SetText(text)
+        CL.ApplyFont(label)
+        btn.label = label
+        btn.tab = tab
+        btn:SetScript("OnClick", function()
+            activeTab = btn.tab
+            scrollOffset = 0
+            HW.RestyleTabs()
+            HW.Refresh()
+        end)
+        return btn
+    end
+
+    f.historyTabBtn = CreateTabButton("History", "history", 6)
+    f.bossesTabBtn = CreateTabButton("Bosses", "bosses", 68)
+
     local clearBtn = CreateFrame("Button", nil, f)
     clearBtn:SetWidth(60)
     clearBtn:SetHeight(16)
-    clearBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 6, -20)
+    clearBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 6, -40)
     clearBtn:SetBackdrop({
         bgFile = "Interface\\BUTTONS\\WHITE8X8", tile = false, tileSize = 0,
         edgeFile = "Interface\\BUTTONS\\WHITE8X8", edgeSize = 1,
@@ -208,10 +280,10 @@ local function CreateWindow()
     rowParent:SetScript("OnMouseWheel", function()
         local delta = arg1
         if not delta then return end
-        local hist = CL.History.GetHistory()
+        local total = (activeTab == "bosses") and table.getn(BuildBossRowList()) or table.getn(CL.History.GetHistory())
         local fit = math.floor((rowParent:GetHeight() + ROW_GAP) / (ROW_HEIGHT + ROW_GAP))
         if fit < 1 then fit = 1 end
-        local maxOff = table.getn(hist) - fit
+        local maxOff = total - fit
         if maxOff < 0 then maxOff = 0 end
         if delta > 0 then scrollOffset = scrollOffset - 1 else scrollOffset = scrollOffset + 1 end
         if scrollOffset < 0 then scrollOffset = 0 end
@@ -279,11 +351,18 @@ local function CreateWindow()
     return f
 end
 
+-- Rows are populated generically from a flat `list`, whatever produced
+-- it - GetHistory()'s plain array (each entry itself the encounter, and
+-- its own 1-based position doubles as encounterIndex) for the History
+-- tab, or BuildBossRowList()'s {bossName, bossIndex, entry} wrapper rows
+-- for the Bosses tab. Bosses tab rows carry bossName/bossIndex instead
+-- of encounterIndex - see CreateRow's delete handler.
 function HW.Refresh()
     if not window or not window:IsShown() then return end
 
-    local hist = CL.History.GetHistory()
-    local total = table.getn(hist)
+    local isBosses = (activeTab == "bosses")
+    local list = isBosses and BuildBossRowList() or CL.History.GetHistory()
+    local total = table.getn(list)
 
     local fit = math.floor((window.rowParent:GetHeight() + ROW_GAP) / (ROW_HEIGHT + ROW_GAP))
     if fit < 1 then fit = 1 end
@@ -298,28 +377,47 @@ function HW.Refresh()
     for i = 1, MAX_ROWS do
         local row = rows[i]
         local index = i + scrollOffset
-        local entry = (i <= fit) and hist[index] or nil
-        if entry then
+        local row_entry = (i <= fit) and list[index] or nil
+        if row_entry then
             shown = shown + 1
-            row.encounterIndex = index
-            row.encounterEntry = entry
-            row.labelText:SetText(entry.label or "Unknown")
-            local durText = string.format("%.0fs", entry.duration or 0)
-            local agoText = FormatTimeAgo(now - (entry.timestamp or now))
+            local encounter = isBosses and row_entry.entry or row_entry
+            row.encounterIndex = isBosses and nil or index
+            row.bossName = isBosses and row_entry.bossName or nil
+            row.bossIndex = isBosses and row_entry.bossIndex or nil
+            row.encounterEntry = encounter
+            row.labelText:SetText(encounter.label or "Unknown")
+            local durText = string.format("%.0fs", encounter.duration or 0)
+            local agoText = FormatTimeAgo(now - (encounter.timestamp or now))
             row.subText:SetText(durText .. "  -  " .. agoText)
             row:Show()
         else
             row.encounterIndex = nil
+            row.bossName = nil
+            row.bossIndex = nil
             row.encounterEntry = nil
             row:Hide()
         end
     end
 
     if shown == 0 then
+        window.emptyLabel:SetText(isBosses and "No boss kills recorded yet" or "No saved encounters yet")
         window.emptyLabel:Show()
     else
         window.emptyLabel:Hide()
     end
+end
+
+-- Highlights whichever tab is active in the current theme color -
+-- called on tab click, on Show, and whenever the theme itself changes
+-- (RestyleRows below) so a live theme switch doesn't leave a stale color
+-- on the tab buttons.
+function HW.RestyleTabs()
+    if not window then return end
+    local r, g, b = CL.GetThemeColor()
+    local activeBtn = (activeTab == "bosses") and window.bossesTabBtn or window.historyTabBtn
+    local inactiveBtn = (activeTab == "bosses") and window.historyTabBtn or window.bossesTabBtn
+    if activeBtn then activeBtn:SetBackdropColor(r, g, b, 0.5) end
+    if inactiveBtn then inactiveBtn:SetBackdropColor(0.15, 0.15, 0.15, 0.75) end
 end
 
 local function RestyleRows()
@@ -331,6 +429,9 @@ local function RestyleRows()
         if window.clearBtn and window.clearBtn.label then
             CL.ApplyFont(window.clearBtn.label)
         end
+        if window.historyTabBtn then CL.ApplyFont(window.historyTabBtn.label) end
+        if window.bossesTabBtn then CL.ApplyFont(window.bossesTabBtn.label) end
+        HW.RestyleTabs()
     end
     local i
     for i = 1, table.getn(rows) do
@@ -344,6 +445,7 @@ CL.OnAppearanceChanged(RestyleRows)
 function HW.Show()
     if not window then CreateWindow() end
     window:Show()
+    HW.RestyleTabs()
     HW.Refresh()
 end
 
@@ -360,11 +462,15 @@ function HW.Toggle()
 end
 
 StaticPopupDialogs["COMBATLEDGER_CLEAR_HISTORY"] = {
-    text = "Clear all saved CombatLedger encounters?",
+    text = "Clear all saved CombatLedger encounters/boss kills for the current tab?",
     button1 = "Yes",
     button2 = "No",
     OnAccept = function()
-        CL.History.ClearHistory()
+        if activeTab == "bosses" then
+            CL.History.ClearBossHistory()
+        else
+            CL.History.ClearHistory()
+        end
         HW.Refresh()
     end,
     timeout = 0,

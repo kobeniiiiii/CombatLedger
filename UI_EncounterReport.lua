@@ -32,21 +32,53 @@ local MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT = 300, 280
 local MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT = 700, 700
 
 local METRIC_UNIT_FIELD = { damage = "damageDone", healing = "healingDone", taken = "damageTaken" }
-local METRIC_LABELS = { damage = "Damage", healing = "Healing", taken = "Taken" }
-local METRIC_ORDER = { "damage", "healing", "taken" }
+local METRIC_LABELS = { damage = "Damage", healing = "Healing", taken = "Taken", abilities = "Abilities" }
+local METRIC_ORDER = { "damage", "healing", "taken", "abilities" }
 local METRIC_COLOR = {
     damage = { 0.95, 0.55, 0.15 },
     healing = { 0.25, 0.85, 0.35 },
     taken = { 0.85, 0.2, 0.2 },
 }
 
+-- "Abilities" mode plots raid-wide damage-by-ability over time (see
+-- Aggregator's abilitySeries - boss fights only) as a multi-line graph
+-- instead of the single-color bar chart the other 3 metrics use. Capped
+-- to the top N by total damage - a real boss rotation still has way more
+-- distinct abilities than are readable as simultaneous lines on a ~400px
+-- graph, so anything past this rank is just left off rather than fighting
+-- for space. Same 6-color wheel doubles as the legend's own swatch order.
+local MAX_GRAPH_ABILITIES = 6
+local ABILITY_LINE_COLORS = {
+    { 0.95, 0.55, 0.15 }, { 0.35, 0.65, 0.95 }, { 0.85, 0.35, 0.85 },
+    { 0.95, 0.85, 0.25 }, { 0.35, 0.85, 0.55 }, { 0.85, 0.25, 0.25 },
+}
+local LINE_THICKNESS = 2
+
 local window = nil
 local toggleBtns = {}
 local graphBars = {}
 local leaderBars = {}
+local graphHoverCols = {}
+-- Per-ability "step line" segments - two textures per gap between
+-- adjacent graph columns (a horizontal run at the earlier point's height,
+-- then a vertical riser up/down to the next point's height), no diagonal
+-- texture rotation needed since vanilla's Texture API doesn't have any.
+-- Sized MAX_GRAPH_ABILITIES x (GRAPH_BARS - 1) pairs, created once and
+-- just shown/hidden/repositioned on every refresh like every other pool
+-- in this file.
+local abilityLineH = {}
+local abilityLineV = {}
 
 local function FormatNumber(n)
     return CL.FormatNumber(n)
+end
+
+local function FormatClock(seconds)
+    seconds = math.floor((seconds or 0) + 0.5)
+    if seconds < 0 then seconds = 0 end
+    local m = math.floor(seconds / 60)
+    local s = seconds - (m * 60)
+    return string.format("%d:%02d", m, s)
 end
 
 local function ClassColorHex(classToken)
@@ -70,13 +102,17 @@ end
 -- average per-second rate over its merged window - averaging by actual
 -- elapsed seconds (not just bucket count) keeps a shorter trailing
 -- group from reading as artificially taller/shorter than a full one.
+-- 3rd return value is how many real seconds of the fight each downsampled
+-- column covers - callers use it to label the X axis and to compute each
+-- column's actual start/end time for tooltips, since a column's width in
+-- raw buckets (perGroup) alone doesn't say that in seconds.
 local function BuildGraphPoints(encounter, metric)
     local series = (encounter and encounter.series) or {}
     local total = table.getn(series)
     local points = {}
-    if total < 1 then return points, 0 end
-
     local bucketSeconds = (CL.Aggregator and CL.Aggregator.SERIES_BUCKET_SECONDS) or 2
+    if total < 1 then return points, 0, bucketSeconds end
+
     local perGroup = math.ceil(total / GRAPH_BARS)
     if perGroup < 1 then perGroup = 1 end
 
@@ -98,7 +134,66 @@ local function BuildGraphPoints(encounter, metric)
         i = i + perGroup
     end
 
-    return points, maxRate
+    return points, maxRate, perGroup * bucketSeconds
+end
+
+-- Same downsample-to-GRAPH_BARS idea as BuildGraphPoints, but per-ability
+-- instead of per-metric, and reading abilitySeries/ABILITY_BUCKET_SECONDS
+-- (1s buckets) instead of series/SERIES_BUCKET_SECONDS (2s). Returns the
+-- top MAX_GRAPH_ABILITIES entries (by whole-fight total), each with its
+-- own `.points` array and `.color`/`.name`/`.total`, plus the shared
+-- maxRate every entry's points were scaled against (so lines stay
+-- comparable to each other on one shared Y axis).
+local function BuildAbilityGraphSeries(encounter)
+    local series = (encounter and encounter.abilitySeries) or {}
+    local totals = (encounter and encounter.abilityTotals) or {}
+    local names = (encounter and encounter.abilityNames) or {}
+    local totalBuckets = table.getn(series)
+    local bucketSeconds = (CL.Aggregator and CL.Aggregator.ABILITY_BUCKET_SECONDS) or 1
+    if totalBuckets < 1 then return {}, 0, bucketSeconds end
+
+    local ranked = {}
+    local key, total
+    for key, total in pairs(totals) do
+        table.insert(ranked, { key = key, total = total, name = names[key] or tostring(key), points = {} })
+    end
+    table.sort(ranked, function(a, b) return a.total > b.total end)
+
+    local top = {}
+    local i
+    for i = 1, MAX_GRAPH_ABILITIES do
+        if ranked[i] then
+            ranked[i].color = ABILITY_LINE_COLORS[i]
+            table.insert(top, ranked[i])
+        end
+    end
+    if table.getn(top) == 0 then return top, 0, bucketSeconds end
+
+    local perGroup = math.ceil(totalBuckets / GRAPH_BARS)
+    if perGroup < 1 then perGroup = 1 end
+
+    local maxRate = 0
+    local groupStart = 1
+    while groupStart <= totalBuckets do
+        local groupEnd = groupStart + perGroup - 1
+        if groupEnd > totalBuckets then groupEnd = totalBuckets end
+        local seconds = (groupEnd - groupStart + 1) * bucketSeconds
+        local a
+        for a = 1, table.getn(top) do
+            local sum = 0
+            local j
+            for j = groupStart, groupEnd do
+                local bucket = series[j]
+                sum = sum + ((bucket and bucket[top[a].key]) or 0)
+            end
+            local rate = (seconds > 0) and (sum / seconds) or 0
+            table.insert(top[a].points, rate)
+            if rate > maxRate then maxRate = rate end
+        end
+        groupStart = groupStart + perGroup
+    end
+
+    return top, maxRate, perGroup * bucketSeconds
 end
 
 local function CreateGraphBar(parent)
@@ -160,6 +255,9 @@ local function RestyleReport()
     CL.ApplyFont(window.subText)
     CL.ApplyFont(window.graphEmptyLabel)
     CL.ApplyFont(window.leaderEmptyLabel)
+    CL.ApplyFont(window.graphPeakLabel)
+    CL.ApplyFont(window.graphStartLabel)
+    CL.ApplyFont(window.graphEndLabel)
     local height = CL.GetBarHeight(BAR_HEIGHT)
     CL.RepositionBarPool(leaderBars, height, BAR_GAP)
     local i
@@ -272,6 +370,71 @@ local function CreateWindow()
         graphBars[i] = CreateGraphBar(graphFrame)
     end
 
+    -- Flat-indexed [ability][segment] pool, segment 1..GRAPH_BARS-1 (one
+    -- fewer gap than points) - plain solid-color textures work fine here
+    -- since every segment is axis-aligned (see the module comment above).
+    local a, s
+    for a = 1, MAX_GRAPH_ABILITIES do
+        abilityLineH[a] = {}
+        abilityLineV[a] = {}
+        for s = 1, GRAPH_BARS - 1 do
+            local h = graphFrame:CreateTexture(nil, "ARTWORK")
+            h:SetTexture("Interface\\BUTTONS\\WHITE8X8")
+            h:Hide()
+            abilityLineH[a][s] = h
+            local v = graphFrame:CreateTexture(nil, "ARTWORK")
+            v:SetTexture("Interface\\BUTTONS\\WHITE8X8")
+            v:Hide()
+            abilityLineV[a][s] = v
+        end
+    end
+
+    -- Axis context - without these, a bar/line's height and X position
+    -- mean nothing to a reader who doesn't already know the fight's
+    -- length and the metric's peak value at a glance. Peak sits inside
+    -- the graph's top-right corner (it's what 100% bar/line height
+    -- MEANS); start/end time sit inside the bottom corners.
+    local peakLabel = graphFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    peakLabel:SetPoint("TOPRIGHT", graphFrame, "TOPRIGHT", -3, -2)
+    CL.ApplyFont(peakLabel)
+    f.graphPeakLabel = peakLabel
+
+    local startTimeLabel = graphFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    startTimeLabel:SetPoint("BOTTOMLEFT", graphFrame, "BOTTOMLEFT", 3, 2)
+    startTimeLabel:SetText("0:00")
+    CL.ApplyFont(startTimeLabel)
+    f.graphStartLabel = startTimeLabel
+
+    local endTimeLabel = graphFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    endTimeLabel:SetPoint("BOTTOMRIGHT", graphFrame, "BOTTOMRIGHT", -3, 2)
+    CL.ApplyFont(endTimeLabel)
+    f.graphEndLabel = endTimeLabel
+
+    -- One invisible hover column per graph slot, spanning the full graph
+    -- height regardless of that column's actual bar/line height - a
+    -- short bar is just as valid a hover target as a tall one. Each
+    -- refresh repositions these and fills in tooltipTitle/tooltipLines;
+    -- the actual GameTooltip display just reads whatever's there.
+    for i = 1, GRAPH_BARS do
+        local col = CreateFrame("Button", nil, graphFrame)
+        col:EnableMouse(true)
+        col:SetHeight(GRAPH_HEIGHT)
+        col:Hide()
+        col:SetScript("OnEnter", function()
+            if not col.tooltipTitle then return end
+            GameTooltip:SetOwner(col, "ANCHOR_TOP")
+            GameTooltip:AddLine(col.tooltipTitle, 1, 0.82, 0)
+            local j
+            for j = 1, table.getn(col.tooltipLines or {}) do
+                local line = col.tooltipLines[j]
+                GameTooltip:AddDoubleLine(line.label, line.value, line.r or 1, line.g or 1, line.b or 1, 1, 1, 1)
+            end
+            GameTooltip:Show()
+        end)
+        col:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        graphHoverCols[i] = col
+    end
+
     local graphEmpty = graphFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
     graphEmpty:SetPoint("CENTER", graphFrame, "CENTER", 0, 0)
     graphEmpty:SetText("No timeline data")
@@ -348,13 +511,141 @@ local function CreateWindow()
     return f
 end
 
+-- Shared by both graph modes - positions/sizes the invisible hover
+-- columns and fills in each one's tooltip content. `buildLines(i)`
+-- returns that column's {label, value, r, g, b} rows; the time-range
+-- title is the same shape for every mode so it's computed once here.
+local function UpdateGraphHoverColumns(numPoints, secondsPerColumn, columnWidth, graphFrame, buildLines)
+    local i
+    for i = 1, GRAPH_BARS do
+        local col = graphHoverCols[i]
+        if i <= numPoints then
+            col:ClearAllPoints()
+            col:SetPoint("BOTTOMLEFT", graphFrame, "BOTTOMLEFT", (i - 1) * columnWidth, 0)
+            col:SetWidth(columnWidth > 1 and columnWidth or 1)
+            local startSec = (i - 1) * secondsPerColumn
+            local endSec = i * secondsPerColumn
+            col.tooltipTitle = "Time " .. FormatClock(startSec) .. " - " .. FormatClock(endSec)
+            col.tooltipLines = buildLines(i)
+            col:Show()
+        else
+            col.tooltipTitle = nil
+            col:Hide()
+        end
+    end
+end
+
+local function HideAllAbilityLines()
+    local a, s
+    for a = 1, MAX_GRAPH_ABILITIES do
+        for s = 1, GRAPH_BARS - 1 do
+            abilityLineH[a][s]:Hide()
+            abilityLineV[a][s]:Hide()
+        end
+    end
+end
+
+-- "Step" interpolation between adjacent points (flat at the earlier
+-- point's height until the next column, then a vertical jump) drawn as
+-- two axis-aligned rectangles - vanilla's Texture API has no rotation, so
+-- a genuine diagonal line isn't an option without a much heavier
+-- per-pixel/Bresenham approach. Reads clearly as "ability X's line" at
+-- the point density GRAPH_BARS already gives every other graph here.
+local function RefreshAbilityGraph(encounter, graphFrame, graphWidth)
+    local top, maxRate, secondsPerColumn = BuildAbilityGraphSeries(encounter)
+    window.abilitySeriesCache = top -- shared with RefreshLeaderboard so the legend matches these exact colors/ranks
+
+    local numAbilities = table.getn(top)
+    local numPoints = (numAbilities > 0) and table.getn(top[1].points) or 0
+
+    if numPoints == 0 or maxRate <= 0 then
+        -- Covers two different cases with one honest message: a genuine
+        -- non-boss encounter (ability data was never collected for it),
+        -- and a boss fight saved/tagged before this feature existed (see
+        -- /cl tagboss - it flips isBossFight retroactively, but can't
+        -- retroactively invent per-second ability data that was never
+        -- recorded live).
+        window.graphEmptyLabel:SetText(numAbilities == 0 and "No ability data recorded for this fight" or "No timeline data")
+        window.graphEmptyLabel:Show()
+        window.graphPeakLabel:SetText("")
+        window.graphEndLabel:SetText("")
+    else
+        window.graphEmptyLabel:Hide()
+        window.graphPeakLabel:SetText("Peak: " .. FormatNumber(maxRate) .. "/s")
+        window.graphEndLabel:SetText(FormatClock(numPoints * secondsPerColumn))
+    end
+
+    UpdateGraphHoverColumns(numPoints, secondsPerColumn, graphWidth / ((numPoints > 0) and numPoints or 1), graphFrame, function(i)
+        local lines = {}
+        local a
+        for a = 1, table.getn(top) do
+            local ability = top[a]
+            table.insert(lines, {
+                label = ability.name,
+                value = FormatNumber(ability.points[i]) .. "/s",
+                r = ability.color[1], g = ability.color[2], b = ability.color[3],
+            })
+        end
+        return lines
+    end)
+
+    local colWidth = graphWidth / ((numPoints > 0) and numPoints or 1)
+
+    local a, i
+    for a = 1, MAX_GRAPH_ABILITIES do
+        local ability = top[a]
+        for i = 1, GRAPH_BARS - 1 do
+            local hTex, vTex = abilityLineH[a][i], abilityLineV[a][i]
+            if ability and maxRate > 0 and i < numPoints then
+                local p1, p2 = ability.points[i], ability.points[i + 1]
+                local pct1 = p1 / maxRate
+                local pct2 = p2 / maxRate
+                if pct1 > 1 then pct1 = 1 end
+                if pct2 > 1 then pct2 = 1 end
+                local y1 = GRAPH_HEIGHT * pct1
+                local y2 = GRAPH_HEIGHT * pct2
+                local x1 = (i - 0.5) * colWidth
+                local x2 = (i + 0.5) * colWidth
+                local color = ability.color
+
+                hTex:ClearAllPoints()
+                hTex:SetPoint("BOTTOMLEFT", graphFrame, "BOTTOMLEFT", x1, y1 - LINE_THICKNESS / 2)
+                hTex:SetWidth((x2 - x1) > 1 and (x2 - x1) or 1)
+                hTex:SetHeight(LINE_THICKNESS)
+                hTex:SetVertexColor(color[1], color[2], color[3], 0.95)
+                hTex:Show()
+
+                local vHeight = math.abs(y2 - y1)
+                vTex:ClearAllPoints()
+                vTex:SetPoint("BOTTOMLEFT", graphFrame, "BOTTOMLEFT", x2 - LINE_THICKNESS / 2, math.min(y1, y2))
+                vTex:SetWidth(LINE_THICKNESS)
+                vTex:SetHeight(vHeight > LINE_THICKNESS and vHeight or LINE_THICKNESS)
+                vTex:SetVertexColor(color[1], color[2], color[3], 0.95)
+                vTex:Show()
+            else
+                hTex:Hide()
+                vTex:Hide()
+            end
+        end
+    end
+end
+
 local function RefreshGraph()
     local encounter = window.encounter
-    local points, maxRate = BuildGraphPoints(encounter, window.metric)
-    local numPoints = table.getn(points)
-    local color = METRIC_COLOR[window.metric]
     local graphFrame = window.graphFrame
     local graphWidth = graphFrame:GetWidth()
+
+    if window.metric == "abilities" then
+        local i
+        for i = 1, GRAPH_BARS do graphBars[i]:Hide() end
+        RefreshAbilityGraph(encounter, graphFrame, graphWidth)
+        return
+    end
+    HideAllAbilityLines()
+
+    local points, maxRate, secondsPerColumn = BuildGraphPoints(encounter, window.metric)
+    local numPoints = table.getn(points)
+    local color = METRIC_COLOR[window.metric]
     -- Stretch to fill the full width regardless of point count, so a
     -- short fight (fewer than GRAPH_BARS downsampled groups) still
     -- reads as a complete graph instead of a partial one hugging the
@@ -362,10 +653,21 @@ local function RefreshGraph()
     local barWidth = graphWidth / ((numPoints > 0) and numPoints or 1)
 
     if numPoints == 0 then
+        window.graphEmptyLabel:SetText("No timeline data")
         window.graphEmptyLabel:Show()
+        window.graphPeakLabel:SetText("")
+        window.graphEndLabel:SetText("")
     else
         window.graphEmptyLabel:Hide()
+        window.graphPeakLabel:SetText("Peak: " .. FormatNumber(maxRate) .. " " .. CL.RateSuffix(window.metric))
+        window.graphEndLabel:SetText(FormatClock(numPoints * secondsPerColumn))
     end
+
+    local metricLabel = METRIC_LABELS[window.metric]
+    local rateSuffix = CL.RateSuffix(window.metric)
+    UpdateGraphHoverColumns(numPoints, secondsPerColumn, barWidth, graphFrame, function(i)
+        return { { label = metricLabel, value = FormatNumber(points[i]) .. " " .. rateSuffix, r = color[1], g = color[2], b = color[3] } }
+    end)
 
     local i
     for i = 1, GRAPH_BARS do
@@ -387,8 +689,44 @@ local function RefreshGraph()
     end
 end
 
+-- Doubles as the ability graph's legend in Abilities mode - reuses
+-- window.abilitySeriesCache (set by RefreshAbilityGraph, which always
+-- runs first in RC.Refresh) so the color swatch on each row is exactly
+-- the color its line was actually drawn in, not a second independent
+-- ranking that could disagree with a tie-break.
 local function RefreshLeaderboard()
     local encounter = window.encounter
+
+    if window.metric == "abilities" then
+        local top = window.abilitySeriesCache or {}
+        local maxVal = (top[1] and top[1].total) or 1
+        local shown = 0
+        local i
+        for i = 1, MAX_LEADER_BARS do
+            local bar = leaderBars[i]
+            local entry = top[i]
+            if entry then
+                shown = shown + 1
+                local color = entry.color or { 0.7, 0.7, 0.7 }
+                bar.statusBar:SetStatusBarColor(color[1], color[2], color[3], 0.9)
+                bar.statusBar:SetValue((maxVal > 0) and (entry.total / maxVal) or 0)
+                bar.nameText:SetText(i .. ". " .. entry.name)
+                bar.valueText:SetText(FormatNumber(entry.total))
+                bar.guid = nil -- no per-player breakdown for an ability legend row
+                bar:Show()
+            else
+                bar.guid = nil
+                bar:Hide()
+            end
+        end
+        if shown == 0 then
+            window.leaderEmptyLabel:Show()
+        else
+            window.leaderEmptyLabel:Hide()
+        end
+        return
+    end
+
     local field = METRIC_UNIT_FIELD[window.metric]
     local list = {}
     if encounter and encounter.units then
@@ -453,6 +791,8 @@ function RC.Refresh()
             btn:SetBackdropColor(0.12, 0.12, 0.12, 0.8)
         end
     end
+
+    window.leaderLabel:SetText((window.metric == "abilities") and "Legend" or "Leaderboard")
 
     RefreshGraph()
     RefreshLeaderboard()
