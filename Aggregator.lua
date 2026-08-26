@@ -662,6 +662,14 @@ end
 
 local function RecordDamage(casterGuid, targetGuid, spellId, spellName, school, amount, isCrit, isOffhand, isPeriodic)
     if not current then
+        -- Self-inflicted damage (Bloodrage, etc.) is never enough on its
+        -- own to lazy-start a session - it's not evidence any real
+        -- encounter is happening, just a roster member (almost always
+        -- the player) damaging themselves. See PLAYER_REGEN_DISABLED's
+        -- comment in Events.lua for the full story - this event still
+        -- gets recorded normally below if an encounter is ALREADY
+        -- running, just never used to spin one up from nothing.
+        if casterGuid and targetGuid and casterGuid == targetGuid then return end
         if not ShouldLazyStart() then return end
         StartEncounter()
     end

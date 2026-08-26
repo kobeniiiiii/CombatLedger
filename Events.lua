@@ -504,7 +504,28 @@ f:SetScript("OnEvent", function()
     if event == "PLAYER_REGEN_DISABLED" then
         LogRegenDiagnostic("DISABLED")
         TouchActivity()
-        CL.Aggregator.StartEncounter()
+        -- Used to eagerly StartEncounter() right here - removed.
+        -- UnitAffectingCombat flipping true isn't proof a real fight is
+        -- starting: Warrior's Bloodrage deals damage to itself as its
+        -- whole mechanic, which flags the player "in combat" with zero
+        -- enemy involved. Confirmed via user report - topping off rage
+        -- between pulls (or just idly) was spinning up a brand new blank
+        -- encounter, which immediately nil'd lastFinished (see
+        -- StartEncounter's own comment) and blanked out whatever real
+        -- fight's frozen summary "Current Fight" was showing, a few
+        -- seconds before FinishEncounter froze that same empty encounter
+        -- right on top of it.
+        --
+        -- Every real combat-exclusive Record* (RecordDamage/
+        -- RecordAvoidance/RecordInterrupt/RecordDebuffGiven) already has
+        -- its own lazy "if not current then StartEncounter()" fallback
+        -- guarded by ShouldLazyStart - for an actual pull, the first
+        -- real hit against an enemy fires this same tick (or the very
+        -- next one), so encounter start is still effectively immediate.
+        -- Training dummies already relied on this exact lazy path anyway
+        -- (see ShouldLazyStart's own comment - dummies don't reliably
+        -- flip UnitAffectingCombat at all, so this handler often never
+        -- even fired for them in the first place).
         if CL.UI and CL.UI.ApplyAutoShow then
             CL.UI.ApplyAutoShow()
         end
