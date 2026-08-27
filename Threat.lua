@@ -97,6 +97,31 @@ local SPELL_DAMAGE_THREAT_MULT = {
     ["Devastate"] = 1.50,
 }
 
+-- [guid] = GetTime() of caster's most recent successful taunt (Taunt/
+-- Challenging Shout/Challenging Roar/Righteous Defense - see Events.lua's
+-- HandleSpellGo, the only structured signal available for a
+-- non-damaging, no-debuff ability like these). The estimation below is
+-- built entirely from accumulated damage/healing, which has no way to
+-- reflect "the mob is now attacking whoever just taunted it" on its
+-- own - without this, a tank who taunts before building any real threat
+-- (a fresh pull, a threat-wipe effect) would show as having none at all,
+-- and one who taunts back aggro mid-fight wouldn't visibly reclaim the
+-- top spot until their real accumulated threat caught back up.
+local recentTaunts = {}
+-- How long a successful taunt keeps its caster pinned to (at least) the
+-- current top threat value - real Taunt's own forced-attack duration is
+-- ~3s, but that's the mechanic that GUARANTEES the mob attacks you, not
+-- a claim that your threat reverts the instant it ends. Long enough to
+-- read as "yes, the taunt worked" and give real threat generation a
+-- chance to catch up before this stops propping the number up.
+local TAUNT_BOOST_DURATION = 6
+local TAUNT_BOOST_MULT = 1.01 -- just enough over the current top to actually rank first, not tie
+
+local function RecordTaunt(casterGuid)
+    if not casterGuid then return end
+    recentTaunts[casterGuid] = GetTime()
+end
+
 local function SpellDamageThreatMult(spell)
     if not spell or spell == "" then return 1.0 end
     local m = SPELL_DAMAGE_THREAT_MULT[spell]
@@ -151,14 +176,43 @@ local function EstimateThreat()
     local enc = CL.Aggregator and CL.Aggregator.GetCurrent and CL.Aggregator.GetCurrent()
     if not enc or not enc.units then return false end
 
-    local newCurrent = {}
-    local maxThreat = 0
+    -- Pass 1: plain accumulated-damage/healing threat, exactly as before -
+    -- also the baseline a taunt boost (pass 2) needs to know it has to
+    -- beat. A unit with a live taunt but zero raw threat (a taunt cast
+    -- before anyone's landed a hit yet) still needs a slot here to
+    -- receive that boost, so the inclusion check covers both cases
+    -- rather than just "threat > 0".
+    local now = GetTime()
+    local raw = {}
+    local rawMax = 0
     local guid, u
     for guid, u in pairs(enc.units) do
         local threat = EstimateUnitThreat(u)
-        if threat > 0 then
-            newCurrent[guid] = { name = u.name or guid, threat = threat, estimated = true }
-            if threat > maxThreat then maxThreat = threat end
+        local taunted = recentTaunts[guid] and (now - recentTaunts[guid]) < TAUNT_BOOST_DURATION
+        if threat > 0 or taunted then
+            raw[guid] = { name = u.name or guid, threat = threat, taunted = taunted }
+            if threat > rawMax then rawMax = threat end
+        end
+    end
+    if not next(raw) then return false end
+
+    -- Pass 2: a live taunt pins its caster to (at least) the current top
+    -- threat value - see RecordTaunt's own comment for why the estimator
+    -- can't derive this from damage/healing data alone. Floored at 1 so
+    -- a taunt landed before anyone's dealt any damage yet still shows
+    -- SOME threat instead of tying everyone else at zero.
+    for guid, entry in pairs(raw) do
+        if entry.taunted then
+            entry.threat = math.max(entry.threat, rawMax * TAUNT_BOOST_MULT, 1)
+        end
+    end
+
+    local newCurrent = {}
+    local maxThreat = 0
+    for guid, entry in pairs(raw) do
+        if entry.threat > 0 then
+            newCurrent[guid] = { name = entry.name, threat = entry.threat, estimated = true }
+            if entry.threat > maxThreat then maxThreat = entry.threat end
         end
     end
 
@@ -474,6 +528,7 @@ local function GetTestSnapshot()
 end
 
 CL.Threat = {
+    RecordTaunt = RecordTaunt,
     GetSnapshot = function() return current end,
     GetTestSnapshot = GetTestSnapshot,
     GetTankGuid = function() return tankGuid end,

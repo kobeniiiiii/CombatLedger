@@ -163,6 +163,47 @@ local function HandleSpellDamage(isSelf, targetGuid, casterGuid, spellId, amount
     end
 end
 
+-- Taunts (Warrior Taunt/Challenging Shout, Druid Challenging Roar, and
+-- this server's own custom tank-cooldown taunts - Paladin's Hand of
+-- Reckoning, Shaman's Earthshaker Slam) generate no damage and no debuff
+-- on the target in vanilla, so none of the events above ever see them
+-- land - SPELL_GO is the only structured "this spell resolved" signal
+-- available for a non-damaging ability (see Nampower's EVENTS.md:
+-- itemId, spellId, casterGuid, targetGuid, castFlags, numHit,
+-- numMissed). Only used for this right now; a real interrupt-detection
+-- feature (Kick/Pummel/Counterspell landing) would also hang off this
+-- same event, but that's a separate, not-yet-wired-up feature - see
+-- Aggregator.lua's RecordInterrupt, which nothing currently calls.
+--
+-- Real vanilla Paladins have no taunt at all (Righteous Defense is a
+-- TBC addition) - this server gives them Hand of Reckoning instead
+-- (spellId 62124, from SuperCleveRoidMacros's own custom-spell data),
+-- and Shaman an entirely custom tanking kit (Earthshaker Slam, spellId
+-- 51365, "Requires Shields" - confirmed live via /cl debug + /cl flush,
+-- caught by SPELL_GO_SELF).
+local TAUNT_SPELL_IDS = {
+    [355] = true,   -- Taunt
+    [1161] = true,  -- Challenging Shout
+    [5209] = true,  -- Challenging Roar
+    [62124] = true, -- Hand of Reckoning (Paladin, this server's taunt)
+    [51365] = true, -- Earthshaker Slam (Shaman, this server's taunt)
+}
+
+local function HandleSpellGo(isSelf, itemId, spellId, casterGuid, targetGuid, castFlags, numHit, numMissed)
+    spellId = tonumber(spellId)
+    numHit = tonumber(numHit) or 0
+    if not TAUNT_SPELL_IDS[spellId] then return end
+    if numHit <= 0 then return end -- fully resisted/immune - no threat effect happened
+    if CL.debug then
+        CL.LogLine(string.format("[SPELL_GO_%s] taunt spell=%s(%s) caster=%s tgt=%s numHit=%s",
+            isSelf and "SELF" or "OTHER", tostring(SpellName(spellId)), tostring(spellId),
+            tostring(casterGuid), tostring(targetGuid), tostring(numHit)))
+    end
+    if CL.Threat and CL.Threat.RecordTaunt then
+        CL.Threat.RecordTaunt(casterGuid)
+    end
+end
+
 local function HandleSpellHeal(targetGuid, casterGuid, spellId, amount, critFlag, periodicFlag)
     amount = tonumber(amount) or 0
     spellId = tonumber(spellId)
@@ -564,6 +605,15 @@ f:SetScript("OnEvent", function()
         return
     end
 
+    if event == "SPELL_GO_SELF" then
+        HandleSpellGo(true, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+        return
+    end
+    if event == "SPELL_GO_OTHER" then
+        HandleSpellGo(false, arg1, arg2, arg3, arg4, arg5, arg6, arg7)
+        return
+    end
+
     -- SPELL_HEAL_ON_SELF deliberately NOT handled (not even registered
     -- below) - confirmed via debug log to always double-fire alongside
     -- whichever BY_* event already covers the same heal (BY_SELF for a
@@ -707,6 +757,8 @@ f:RegisterEvent("AUTO_ATTACK_SELF")
 f:RegisterEvent("AUTO_ATTACK_OTHER")
 f:RegisterEvent("SPELL_DAMAGE_EVENT_SELF")
 f:RegisterEvent("SPELL_DAMAGE_EVENT_OTHER")
+f:RegisterEvent("SPELL_GO_SELF")
+f:RegisterEvent("SPELL_GO_OTHER")
 f:RegisterEvent("SPELL_HEAL_BY_SELF")
 f:RegisterEvent("SPELL_HEAL_BY_OTHER")
 -- SPELL_HEAL_ON_SELF not registered - see OnEvent's comment, it's a
