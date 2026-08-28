@@ -350,29 +350,43 @@ end
 -- "the stop isn't instant" (the fight really did end fine; a trailing
 -- event just erased the result a moment later).
 --
--- Purely time-based (elapsed since lastFinished), deliberately NOT
--- gated on UnitAffectingCombat("player") at all - two separate failure
--- modes each ruled that out on their own:
---   - Requiring the flag to be true dropped a fresh pull's entire FIRST
---     hit whenever it arrived before the flag flipped, confirmed via
---     debug log against a training dummy - dummies here don't reliably
---     flip the player's own combat flag at all (Immolate's opening
---     burn, 334 of its 1044 total, silently missing every single time).
---   - Trusting the flag when it reads true is just as unreliable: a raid
---     fight routinely leaves a DoT (Rend, etc.) ticking on some target
---     for a few more seconds after the fight is over from CombatLedger's
---     own point of view, and healing/assisting a raid member who's
---     still combat-tagged tags the healer too - confirmed via user
---     report, a healer topping off targets still ticking down leftover
---     DoTs kept re-triggering a bogus new encounter right after a real
---     one finished, wiping its frozen Current Fight display, because
---     their own flag was still (correctly!) true from the fight that
---     JUST ended.
--- Net result: the flag can't be trusted whether it's true OR false right
--- around a fight's boundary, so this doesn't consult it either way -
--- only "how long since the last one ended" actually holds up.
-local PHANTOM_GUARD_WINDOW = 6 -- seconds after a fight ends where a hit is treated as a trailing event, not a new pull - a little past vanilla's own ~5s combat-flag decay time
+-- Used to be skipped for RecordDamage/RecordAvoidance/RecordInterrupt/
+-- RecordDebuffGiven specifically, on the theory that gating on combat
+-- risked dropping the first hit of a fresh pull if UnitAffectingCombat
+-- hadn't flipped true yet. That theory DID pan out after all, confirmed
+-- via debug log against a training dummy: dummies here don't reliably
+-- flip the player's own combat flag at all, so gating unconditionally
+-- on it dropped a real spell's entire initial hit (Immolate's opening
+-- burn, 334 of its 1044 total) every single time - the encounter's
+-- FIRST event is exactly the one this guard can't afford to reject.
+--
+-- Checks the PLAYER's own combat flag specifically, NOT the whole
+-- group's - used to check raid/party members too, which reintroduced
+-- the exact bug this guard exists to prevent: your own fight ends
+-- (current freezes into lastFinished), but a groupmate is still
+-- fighting, so their trailing damage/heal event still passed the
+-- "someone's in combat" check and restarted a blank encounter right
+-- on top of your just-finished result. GreedMeter (this addon's own
+-- reference point) ties recording to the player's own personal combat
+-- state exactly like this, not the raid's - matching that.
+local function IsPlayerInCombat()
+    local ok, playerCombat = pcall(UnitAffectingCombat, "player")
+    return ok and playerCombat and true or false
+end
+
+-- The actual guard every Record*'s lazy "if not current then
+-- StartEncounter()" uses (see above) - combines both fixes instead of
+-- picking one at the other's expense. IsPlayerInCombat() alone always
+-- passes; the phantom-encounter risk only ever came from a stray
+-- TRAILING event shortly after a real fight just ended, not from a
+-- genuine fresh pull. So: allow immediately if the player's combat flag
+-- already agrees, OR if it's been a while (no encounter recently ended,
+-- or long enough since one did) - only refuse in the narrow window
+-- right after lastFinished was set, where a still-unflagged hit is far
+-- more likely a trailing tick than a real new pull.
+local PHANTOM_GUARD_WINDOW = 3 -- seconds after a fight ends where an unflagged hit is treated as a trailing event, not a new pull
 local function ShouldLazyStart()
+    if IsPlayerInCombat() then return true end
     if lastFinishedTime and (GetTime() - lastFinishedTime) < PHANTOM_GUARD_WINDOW then
         return false
     end
