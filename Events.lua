@@ -547,6 +547,16 @@ f:SetScript("OnEvent", function()
         -- as Lua locals otherwise. See Aggregator.lua's
         -- SerializeState/RestoreState.
         CombatLedgerDB.liveState = CL.Aggregator.SerializeState()
+
+        -- Remembers the main window's exact shown/hidden state so
+        -- closing it (via /cl hide, /cl toggle, or the minimap icon)
+        -- actually sticks across a logout/reload - UI.RestoreAllWindows
+        -- otherwise unconditionally shows it again next login regardless
+        -- of having just been closed, since none of its other
+        -- suppression rules (Auto-hide/Grouped-only) have anything to do
+        -- with a direct manual close.
+        local mainInst = CL.UIWindows and CL.UIWindows["main"]
+        CL.SetSetting("mainWindowHidden", not (mainInst and mainInst.frame and mainInst.frame:IsShown()))
         return
     end
 

@@ -1521,8 +1521,8 @@ end
 -- no part here on purpose - it's a "combat just started" trigger, not a
 -- statement about the window's resting state.
 function UI.RestoreAllWindows()
-    local function RestoreOne(id, inst)
-        if UI.IsSuppressedNow(id) then
+    local function RestoreOne(id, inst, forceHidden)
+        if forceHidden or UI.IsSuppressedNow(id) then
             CreateWindowFrame(inst)
             inst.frame:Hide()
         else
@@ -1530,7 +1530,14 @@ function UI.RestoreAllWindows()
         end
     end
 
-    RestoreOne("main", instances["main"])
+    -- Main's exact shown/hidden state at last logout is remembered and
+    -- restored as-is (see Events.lua's PLAYER_LOGOUT handler) - unlike
+    -- every other check RestoreOne makes, which are all "should this be
+    -- up RIGHT NOW" rules re-evaluated fresh each login, a direct manual
+    -- close has no settings toggle of its own to re-derive from, so
+    -- without this it silently reappeared on every subsequent login
+    -- regardless of having just been closed.
+    RestoreOne("main", instances["main"], CL.GetSetting("mainWindowHidden") == true)
 
     local ids = CL.GetExtraWindowIds()
     local i
