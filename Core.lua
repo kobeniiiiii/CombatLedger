@@ -38,13 +38,22 @@ CombatLedgerDB.settings = CombatLedgerDB.settings or {}
 CL.db = CombatLedgerDB
 
 -- Encounter-end timing - deliberately NOT a user setting (no Options
--- control, no /cl set). Combat dropping (PLAYER_REGEN_ENABLED) IS the
--- end of an encounter, immediately, no tolerance window - see Events.lua.
--- This is the one remaining fallback: some targets (training dummies on
--- at least this server) never toggle the regen flag at all, so an
--- encounter against one would otherwise never end. No combat event of
--- any kind for this long force-ends it regardless of regen state.
+-- control, no /cl set). See Events.lua's OnUpdate idle check for the
+-- full reasoning - PLAYER_REGEN_ENABLED no longer ends an encounter
+-- directly; ending is entirely "no relevant event for this long," using
+-- one of these two thresholds depending on the player's own combat flag.
+--
+-- IDLE_SECONDS: the training-dummy fallback - some targets on at least
+-- this server never toggle the regen flag at all, so without this an
+-- encounter against one would never end on its own. Long, since the
+-- player might genuinely still be mid-fight themselves.
 CL.IDLE_SECONDS = 12
+-- POST_COMBAT_IDLE_SECONDS: once the player's own flag HAS cleared, this
+-- is the real "is anyone in the tracked roster still doing anything"
+-- window - short, since nobody's personally fighting from this client's
+-- point of view anymore, just long enough to absorb a last DoT tick/
+-- heal/overkill without chopping it off mid-fall.
+CL.POST_COMBAT_IDLE_SECONDS = 3
 
 -- Tunable settings, saved-variable-backed so they survive /reload and
 -- exposed in the Options window - see UI_Options.lua.

@@ -346,28 +346,19 @@ end
 
 local autoShownMainWindow = false -- see the PLAYER_ENTERING_WORLD handler below
 
--- Some targets (training dummies, on at least this server) never toggle
--- PLAYER_REGEN_DISABLED/ENABLED at all, so an encounter against one
--- would otherwise never end. This is the fallback for that specific
--- case: no combat event of any kind for CL.IDLE_SECONDS force-ends the
--- encounter regardless of the regen flag. Everything else about when an
--- encounter ends is regen state alone - PLAYER_REGEN_ENABLED below ends
--- it immediately, always, no tolerance window, no group check. One
--- continuous engagement (any number of mobs, chained or simultaneous)
--- is one encounter as long as combat never actually drops; the moment
--- it does, that encounter is over, full stop - the next
--- PLAYER_REGEN_DISABLED always starts a new one, never resumes the old
--- one.
---
--- A group-wait (defer finishing until every raid/party member's own
--- combat flag also clears) used to live here, added after debug
--- logging caught a real instance of the player's own regen clearing
--- while 4 raid members were still UnitAffectingCombat()-true. Removed
--- again - GreedMeter (this addon's own reference point) has no such
--- check at all and reportedly never fragments a pull in months of real
--- use, so the theoretical risk isn't worth the stop feeling delayed on
--- every single fight to guard against an edge case that doesn't
--- actually bite in practice.
+-- An encounter ends purely from activity going quiet (see the OnUpdate
+-- idle check further down and CL.POST_COMBAT_IDLE_SECONDS/IDLE_SECONDS
+-- in Core.lua) - not from PLAYER_REGEN_ENABLED directly, and never from
+-- polling anyone else's UnitAffectingCombat. Both of those were tried:
+-- ending immediately on this player's own regen flag fragmented raid
+-- pulls (a lingering DoT/heal tick on someone else phantom-restarted a
+-- blank encounter right after a real one ended); gating that on a
+-- raid-wide "is anyone else still in combat" check went too far the
+-- other way and left Current Fight stuck open for an entire raid, since
+-- SOMEONE in a large raid can be combat-tagged for reasons unrelated to
+-- this encounter almost continuously. lastEventTime (this addon's own
+-- tracked-roster activity signal, not a native combat flag) is what
+-- actually tells the two apart.
 local function IsGrouped()
     return ((GetNumRaidMembers and GetNumRaidMembers()) or 0) > 0
         or ((GetNumPartyMembers and GetNumPartyMembers()) or 0) > 0
@@ -378,31 +369,6 @@ end
 -- transition, not on every roster change while already grouped (someone
 -- else joining/leaving a raid you're already in shouldn't wipe Overall).
 local wasGrouped = IsGrouped()
-
--- Checks whether anyone else in the group is still flagged in combat.
--- On this client, GetNumPartyMembers() has been observed nonzero AT THE
--- SAME TIME as GetNumRaidMembers() while genuinely in a raid (a real
--- quirk, seen in the diagnostic log) - so this checks BOTH ranges
--- whenever they're nonzero rather than assuming they're mutually
--- exclusive, to avoid missing raid members if partyN is stale.
-local function AnyGroupMemberInCombat()
-    local raidN = (GetNumRaidMembers and GetNumRaidMembers()) or 0
-    local partyN = (GetNumPartyMembers and GetNumPartyMembers()) or 0
-    local i
-    if raidN > 0 then
-        for i = 1, raidN do
-            local ok, inCombat = pcall(UnitAffectingCombat, "raid" .. i)
-            if ok and inCombat then return true end
-        end
-    end
-    if partyN > 0 then
-        for i = 1, partyN do
-            local ok, inCombat = pcall(UnitAffectingCombat, "party" .. i)
-            if ok and inCombat then return true end
-        end
-    end
-    return false
-end
 
 local function FinishEncounter()
     -- lastEventTime (touched by every relevant combat event - see
@@ -593,7 +559,18 @@ f:SetScript("OnEvent", function()
 
     if event == "PLAYER_REGEN_ENABLED" then
         LogRegenDiagnostic("ENABLED")
-        FinishEncounter()
+        -- Deliberately does NOT call FinishEncounter itself anymore - see
+        -- the OnUpdate idle check below (and CL.POST_COMBAT_IDLE_SECONDS'
+        -- own comment in Core.lua) for the real reasoning. Ending on this
+        -- event immediately, unconditionally, fragmented raid pulls
+        -- (a lingering DoT/heal on someone else phantom-restarted a blank
+        -- encounter moments later); gating it on a raid-wide "is anyone
+        -- else still in combat" poll went too far the other way and left
+        -- Current Fight stuck open for the rest of the raid, since a
+        -- large raid can have SOMEONE combat-tagged for unrelated reasons
+        -- almost continuously. The idle check's own tracked-roster
+        -- activity signal (lastEventTime) handles both cases correctly
+        -- without polling anyone's combat flag but the player's own.
         return
     end
 
@@ -704,7 +681,6 @@ end)
 -- throttles it to roughly once a second instead, using the same
 -- OnUpdate the end-of-encounter checks below already run on.
 local flushAccum = 0
-local idleSuppressedLogged = false
 f:SetScript("OnUpdate", function()
     flushAccum = flushAccum + arg1
     if flushAccum >= 1 then
@@ -724,35 +700,43 @@ f:SetScript("OnUpdate", function()
         end
     end
 
-    if CL.Aggregator.GetCurrent() and lastEventTime > 0 and (GetTime() - lastEventTime) > CL.IDLE_SECONDS then
-        -- This fallback exists for targets that never toggle regen at
-        -- all (training dummies) - solo, that's the only way an
-        -- encounter against one would ever end. But in a group, a local
-        -- lull in events the player happens to be involved in doesn't
-        -- mean the raid stopped fighting (e.g. a healer standing off to
-        -- the side of a melee pack can easily see 12+ quiet seconds of
-        -- its own). Same guard as the regen path: don't let this fire
-        -- while someone else in the group is still actually in combat,
-        -- or this ends the encounter and Aggregator.lua's lazy
-        -- "if not current then StartEncounter()" immediately spins up a
-        -- new one on the very next raid-wide event, fragmenting one
-        -- continuous pull into several.
-        local grouped = ((GetNumRaidMembers and GetNumRaidMembers()) or 0) > 0
-            or ((GetNumPartyMembers and GetNumPartyMembers()) or 0) > 0
-        if not grouped or not AnyGroupMemberInCombat() then
-            if CL.debug and grouped and idleSuppressedLogged then
-                CL.LogLine("[REGEN] idle-timeout finishing - group also clear")
-            end
-            idleSuppressedLogged = false
+    -- The SOLE mechanism that ends an encounter - PLAYER_REGEN_ENABLED no
+    -- longer calls FinishEncounter directly (see that handler's comment).
+    -- Two thresholds, picked by the PLAYER'S OWN combat flag only - never
+    -- a raid-wide poll of everyone else's UnitAffectingCombat, which
+    -- proved unusable in both directions: too permissive when trusted as
+    -- "someone's still fighting" (a lingering DoT/heal tick on an
+    -- unrelated raid member phantom-restarted a blank encounter right
+    -- after a real one ended), and too sticky when required as "nobody's
+    -- fighting yet" (a 29-person raid can have SOMEONE combat-tagged for
+    -- reasons that have nothing to do with this encounter almost
+    -- continuously, which left Current Fight stuck open for the rest of
+    -- the raid night).
+    --
+    -- lastEventTime only advances on RELEVANT events (this addon's own
+    -- tracked-roster filter - see IsRelevant), a far more precise "is
+    -- this fight still actually going" signal than any native combat
+    -- flag: someone else's real, recorded damage/heal keeps this fresh
+    -- for exactly as long as the fight legitimately continues, and
+    -- nothing irrelevant (a hunter's pet tagging something unrelated, a
+    -- stray world mob) can extend it.
+    --
+    -- SHORT threshold once the player's own flag has cleared: they
+    -- personally aren't fighting anymore, so a few quiet seconds from
+    -- the WHOLE tracked roster is plenty to call it - long enough to
+    -- absorb a last DoT tick/heal/overkill without chopping it off,
+    -- short enough that solo/small-group play still ends promptly.
+    -- LONG threshold while the flag is still true (or ambiguous, e.g.
+    -- training dummies here don't reliably flip it either way): the
+    -- player might still be mid-fight themselves, so this is purely the
+    -- dummy fallback (nothing else would ever end that encounter) and
+    -- can afford to be patient.
+    if CL.Aggregator.GetCurrent() and lastEventTime > 0 then
+        local ok, playerCombat = pcall(UnitAffectingCombat, "player")
+        local threshold = (ok and playerCombat) and CL.IDLE_SECONDS or CL.POST_COMBAT_IDLE_SECONDS
+        if (GetTime() - lastEventTime) > threshold then
             FinishEncounter()
-        else
-            if CL.debug and not idleSuppressedLogged then
-                CL.LogLine("[REGEN] idle-timeout suppressed - group still in combat")
-            end
-            idleSuppressedLogged = true
         end
-    else
-        idleSuppressedLogged = false
     end
 end)
 
