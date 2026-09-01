@@ -346,19 +346,27 @@ end
 
 local autoShownMainWindow = false -- see the PLAYER_ENTERING_WORLD handler below
 
--- An encounter ends purely from activity going quiet (see the OnUpdate
--- idle check further down and CL.POST_COMBAT_IDLE_SECONDS/IDLE_SECONDS
--- in Core.lua) - not from PLAYER_REGEN_ENABLED directly, and never from
--- polling anyone else's UnitAffectingCombat. Both of those were tried:
--- ending immediately on this player's own regen flag fragmented raid
--- pulls (a lingering DoT/heal tick on someone else phantom-restarted a
--- blank encounter right after a real one ended); gating that on a
--- raid-wide "is anyone else still in combat" check went too far the
--- other way and left Current Fight stuck open for an entire raid, since
--- SOMEONE in a large raid can be combat-tagged for reasons unrelated to
--- this encounter almost continuously. lastEventTime (this addon's own
--- tracked-roster activity signal, not a native combat flag) is what
--- actually tells the two apart.
+-- An encounter ends the instant the PLAYER's own regen flag clears (see
+-- PLAYER_REGEN_ENABLED below) - matching GreedMeter's OM:StopCombat and
+-- Details' own instant CombatEndedAt, both called unconditionally off
+-- their personal regen event with no delay. A raid-wide poll of anyone
+-- else's UnitAffectingCombat was tried and reverted: SOMEONE in a large
+-- raid can be combat-tagged for reasons unrelated to this encounter
+-- almost continuously, which left Current Fight stuck open for the rest
+-- of the raid. A delayed/idle-only end was also tried and reverted per
+-- direct user report - it left the meter visibly running for 2-3s after
+-- the player was demonstrably done fighting, which is worse than the
+-- rare phantom-restart it was meant to avoid. That phantom case (a
+-- lingering DoT/heal tick on someone else spinning up a new blank
+-- encounter moments after a real one just ended) is guarded where the
+-- restart actually happens instead: Aggregator.lua's ShouldLazyStart
+-- already refuses to lazy-start within PHANTOM_GUARD_WINDOW of the last
+-- finish unless the player's own IsPlayerInCombat() says otherwise, which
+-- is the correct place to stop a phantom restart without delaying the
+-- real end. The OnUpdate idle check further down (CL.IDLE_SECONDS /
+-- CL.POST_COMBAT_IDLE_SECONDS in Core.lua) still runs as a backstop only,
+-- for when the native flag itself never clears or lags badly (a training
+-- dummy, or the well-known vanilla pet/DoT REGEN_ENABLED delay).
 local function IsGrouped()
     return ((GetNumRaidMembers and GetNumRaidMembers()) or 0) > 0
         or ((GetNumPartyMembers and GetNumPartyMembers()) or 0) > 0
@@ -559,18 +567,13 @@ f:SetScript("OnEvent", function()
 
     if event == "PLAYER_REGEN_ENABLED" then
         LogRegenDiagnostic("ENABLED")
-        -- Deliberately does NOT call FinishEncounter itself anymore - see
-        -- the OnUpdate idle check below (and CL.POST_COMBAT_IDLE_SECONDS'
-        -- own comment in Core.lua) for the real reasoning. Ending on this
-        -- event immediately, unconditionally, fragmented raid pulls
-        -- (a lingering DoT/heal on someone else phantom-restarted a blank
-        -- encounter moments later); gating it on a raid-wide "is anyone
-        -- else still in combat" poll went too far the other way and left
-        -- Current Fight stuck open for the rest of the raid, since a
-        -- large raid can have SOMEONE combat-tagged for unrelated reasons
-        -- almost continuously. The idle check's own tracked-roster
-        -- activity signal (lastEventTime) handles both cases correctly
-        -- without polling anyone's combat flag but the player's own.
+        -- Ends the encounter immediately, unconditionally, on the
+        -- player's own regen flag - see FinishEncounter's comment above
+        -- for why this replaced the idle-only design. FinishEncounter
+        -- itself no-ops when there's nothing running (EndEncounter
+        -- returns nil), so this is safe even if the OnUpdate backstop
+        -- already closed it out.
+        FinishEncounter()
         return
     end
 
@@ -700,37 +703,27 @@ f:SetScript("OnUpdate", function()
         end
     end
 
-    -- The SOLE mechanism that ends an encounter - PLAYER_REGEN_ENABLED no
-    -- longer calls FinishEncounter directly (see that handler's comment).
-    -- Two thresholds, picked by the PLAYER'S OWN combat flag only - never
-    -- a raid-wide poll of everyone else's UnitAffectingCombat, which
-    -- proved unusable in both directions: too permissive when trusted as
+    -- Backstop only - the normal close is PLAYER_REGEN_ENABLED calling
+    -- FinishEncounter directly and immediately (see that handler). This
+    -- only matters when the native flag itself never clears or lags: a
+    -- training dummy doesn't reliably flip UnitAffectingCombat either way,
+    -- and vanilla can delay REGEN_ENABLED itself well behind the player's
+    -- real last action when a pet or DoT is still ticking. Never a
+    -- raid-wide poll of everyone else's UnitAffectingCombat, which proved
+    -- unusable in both directions: too permissive when trusted as
     -- "someone's still fighting" (a lingering DoT/heal tick on an
     -- unrelated raid member phantom-restarted a blank encounter right
     -- after a real one ended), and too sticky when required as "nobody's
     -- fighting yet" (a 29-person raid can have SOMEONE combat-tagged for
     -- reasons that have nothing to do with this encounter almost
     -- continuously, which left Current Fight stuck open for the rest of
-    -- the raid night).
-    --
-    -- lastEventTime only advances on RELEVANT events (this addon's own
-    -- tracked-roster filter - see IsRelevant), a far more precise "is
-    -- this fight still actually going" signal than any native combat
-    -- flag: someone else's real, recorded damage/heal keeps this fresh
-    -- for exactly as long as the fight legitimately continues, and
-    -- nothing irrelevant (a hunter's pet tagging something unrelated, a
-    -- stray world mob) can extend it.
-    --
-    -- SHORT threshold once the player's own flag has cleared: they
-    -- personally aren't fighting anymore, so a few quiet seconds from
-    -- the WHOLE tracked roster is plenty to call it - long enough to
-    -- absorb a last DoT tick/heal/overkill without chopping it off,
-    -- short enough that solo/small-group play still ends promptly.
-    -- LONG threshold while the flag is still true (or ambiguous, e.g.
-    -- training dummies here don't reliably flip it either way): the
-    -- player might still be mid-fight themselves, so this is purely the
-    -- dummy fallback (nothing else would ever end that encounter) and
-    -- can afford to be patient.
+    -- the raid night). lastEventTime only advances on RELEVANT events
+    -- (this addon's own tracked-roster filter - see IsRelevant), so it's
+    -- what this backstop uses instead: LONG threshold while the player's
+    -- own flag is still true (or ambiguous) since they might genuinely
+    -- still be mid-fight; SHORT threshold once it's cleared, since by then
+    -- REGEN_ENABLED should already have closed it out and this is only
+    -- catching the case where that somehow didn't happen.
     if CL.Aggregator.GetCurrent() and lastEventTime > 0 then
         local ok, playerCombat = pcall(UnitAffectingCombat, "player")
         local threshold = (ok and playerCombat) and CL.IDLE_SECONDS or CL.POST_COMBAT_IDLE_SECONDS
