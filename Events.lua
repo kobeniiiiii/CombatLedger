@@ -388,15 +388,20 @@ local function FinishEncounter()
 
     -- Skip saving near-nothing encounters (a stray hit that barely
     -- registered before the idle timeout) - not worth a history slot.
-    -- Boss fights (see Aggregator's isBossFight) go into their own
-    -- per-boss-name bucket instead of the regular capped list, so they
-    -- can't get pushed out by a busy trash-clearing session - see
-    -- History.lua's SaveBossEncounter.
+    -- Boss fights (see Aggregator's isBossFight) ALSO go into their own
+    -- per-boss-name bucket, in addition to the regular capped list below -
+    -- so a boss kill still shows up in the main window's quick "recent"
+    -- segment dropdown (UI_MainWindow.lua's segment menu, which only
+    -- reads GetHistory()) immediately after the fight, while remaining
+    -- safe from a busy trash-clearing session evicting it out of that
+    -- capped list before anyone gets a chance to look at it - see
+    -- History.lua's SaveBossEncounter. Both calls share the same
+    -- `finished` table (not a copy); nothing mutates a saved encounter
+    -- after this point, so that's fine.
     if finished.duration > 1 and CL.TableCount(finished.units) > 0 and CL.History then
+        CL.History.SaveEncounter(finished)
         if finished.isBossFight and CL.History.SaveBossEncounter then
             CL.History.SaveBossEncounter(finished)
-        else
-            CL.History.SaveEncounter(finished)
         end
     end
 

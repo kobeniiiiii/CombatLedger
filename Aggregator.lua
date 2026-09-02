@@ -384,12 +384,27 @@ end
 -- or long enough since one did) - only refuse in the narrow window
 -- right after lastFinished was set, where a still-unflagged hit is far
 -- more likely a trailing tick than a real new pull.
+--
+-- IsPlayerInCombat() itself isn't perfectly clean evidence, though -
+-- confirmed via debug log: a mob's Cloud of Disease ground effect kept
+-- ticking the player 2s after that same mob's fight had already ended,
+-- which flips UnitAffectingCombat true for that instant same as a real
+-- swing would. caster/targetGuid (when the caller has them) catch this
+-- one: within the guard window, a hit involving someone who was already
+-- a participant in the fight that just ended is far more likely that
+-- fight's own residue (a lingering DoT/cloud, a delayed tick) than a
+-- fresh pull, so it's refused even though the flag says otherwise. A
+-- genuinely new pull's mob was never in lastFinished.units and sails
+-- through untouched.
 local PHANTOM_GUARD_WINDOW = 3 -- seconds after a fight ends where an unflagged hit is treated as a trailing event, not a new pull
-local function ShouldLazyStart()
-    if IsPlayerInCombat() then return true end
-    if lastFinishedTime and (GetTime() - lastFinishedTime) < PHANTOM_GUARD_WINDOW then
+local function ShouldLazyStart(casterGuid, targetGuid)
+    local withinGuardWindow = lastFinishedTime and (GetTime() - lastFinishedTime) < PHANTOM_GUARD_WINDOW
+    if withinGuardWindow and lastFinished and lastFinished.units
+        and ((casterGuid and lastFinished.units[casterGuid]) or (targetGuid and lastFinished.units[targetGuid])) then
         return false
     end
+    if IsPlayerInCombat() then return true end
+    if withinGuardWindow then return false end
     return true
 end
 
@@ -720,7 +735,7 @@ local function RecordDamage(casterGuid, targetGuid, spellId, spellName, school, 
         -- gets recorded normally below if an encounter is ALREADY
         -- running, just never used to spin one up from nothing.
         if casterGuid and targetGuid and casterGuid == targetGuid then return end
-        if not ShouldLazyStart() then return end
+        if not ShouldLazyStart(casterGuid, targetGuid) then return end
         StartEncounter()
     end
 
@@ -896,7 +911,7 @@ end
 -- writes into both current and overall like every other Record* call.
 local function RecordAvoidance(casterGuid, targetGuid, victimState, isOffhand)
     if not current then
-        if not ShouldLazyStart() then return end
+        if not ShouldLazyStart(casterGuid, targetGuid) then return end
         StartEncounter()
     end
     local key = VICTIMSTATE_KEY[victimState] or "other"
@@ -983,7 +998,7 @@ end
 
 local function RecordDebuffGiven(casterGuid, targetGuid, spellId, spellName)
     if not current then
-        if not ShouldLazyStart() then return end
+        if not ShouldLazyStart(casterGuid, targetGuid) then return end
         StartEncounter()
     end
     RecordCountEventInto(current.units, "debuffsGiven", casterGuid, targetGuid, spellId, spellName)
@@ -992,7 +1007,7 @@ end
 
 local function RecordInterrupt(casterGuid, targetGuid, spellId, spellName)
     if not current then
-        if not ShouldLazyStart() then return end
+        if not ShouldLazyStart(casterGuid, targetGuid) then return end
         StartEncounter()
     end
     RecordCountEventInto(current.units, "interrupts", casterGuid, targetGuid, spellId, spellName)
