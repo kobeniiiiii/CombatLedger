@@ -572,6 +572,17 @@ f:SetScript("OnEvent", function()
 
     if event == "PLAYER_REGEN_ENABLED" then
         LogRegenDiagnostic("ENABLED")
+        -- Dying also clears this flag, same as a real fight ending - but
+        -- the raid can easily still be fighting a boss the player just
+        -- died to, and finishing here would split one continuous kill
+        -- into "before I died" / "after I died" as two separate saved
+        -- encounters (confirmed by user report). Skip the direct finish
+        -- in that case and defer to the OnUpdate idle backstop below,
+        -- which tracks the WHOLE roster's activity (lastEventTime), not
+        -- just this player's flag - it'll correctly close the encounter
+        -- once everyone's really done, dead player included.
+        local ok, dead = pcall(UnitIsDeadOrGhost, "player")
+        if ok and dead then return end
         -- Ends the encounter immediately, unconditionally, on the
         -- player's own regen flag - see FinishEncounter's comment above
         -- for why this replaced the idle-only design. FinishEncounter
