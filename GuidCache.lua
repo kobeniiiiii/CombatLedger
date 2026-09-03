@@ -169,6 +169,22 @@ local function GetOwner(guid)
     return petOwner[guid]
 end
 
+-- Reverse of GetOwner - which pet (if any) belongs to this owner guid.
+-- Only Threat.lua needs this direction (to give a split-out pet threat
+-- row its own real guid/name instead of a synthetic one) - the regular
+-- damage/healing meters only ever need the forward petOwner -> owner
+-- direction above, to roll a pet's numbers into its owner's bar.
+-- petOwner is small (at most one entry per raid/party slot), so a linear
+-- scan here is fine.
+local function GetPetGuid(ownerGuid)
+    if not ownerGuid then return nil end
+    local pGuid, oGuid
+    for pGuid, oGuid in pairs(petOwner) do
+        if oGuid == ownerGuid then return pGuid end
+    end
+    return nil
+end
+
 CL.GuidCache = {
     Resolve = Resolve,
     Purge = Purge,
@@ -176,4 +192,5 @@ CL.GuidCache = {
     RefreshRoster = RefreshRoster,
     IsTracked = IsTracked,
     GetOwner = GetOwner,
+    GetPetGuid = GetPetGuid,
 }

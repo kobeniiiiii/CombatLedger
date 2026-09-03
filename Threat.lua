@@ -139,8 +139,24 @@ end
 -- entry (damageDone/healingDone, already tracked for the meter itself -
 -- no separate data collection needed). Healing counted at ~0.5x
 -- effective heal, matching classic-era threat mechanics.
+--
+-- Returns TWO values: the owner's own threat, and separately whatever
+-- their pet's melee contributed (Aggregator's petMelee/petOffhand sub-
+-- buckets - see MeleeEntryFor). A pet holds its own real entry on the
+-- mob's threat table, distinct from its owner's - folding it into one
+-- number (which the regular damage/healing meters deliberately do, for
+-- a cleaner per-player bar) would misrepresent an actual pet-tanking
+-- situation here, so Threat mode keeps it split. No class-threat-mod is
+-- applied to the pet's share - that modifier is a player stance/talent
+-- thing, not something pet threat generation is subject to.
+--
+-- Known gap: this only splits pet MELEE. A pet's occasional damaging
+-- spell (Imp's Firebolt, Felhunter's Shadow Bite) has no such split in
+-- Aggregator's data (spellId-based damage has no isPet tag at all) and
+-- stays folded into the owner's own total - not worth a data-model
+-- change in Aggregator just for this edge case.
 local function EstimateUnitThreat(u)
-    if not u then return 0 end
+    if not u then return 0, 0 end
     local mod = 1.0
     if u.classToken and CLASS_THREAT_MOD[u.classToken] then
         mod = CLASS_THREAT_MOD[u.classToken]
@@ -154,10 +170,14 @@ local function EstimateUnitThreat(u)
         end
     end
     -- Melee entries live outside .spells (see Aggregator.lua's
-    -- MeleeEntryFor) - fold in at the plain 1x rate.
+    -- MeleeEntryFor) - fold in at the plain 1x rate. Pet melee/offhand
+    -- are kept OUT of the owner's own total - see petThreat below.
+    local petThreat = 0
     if u.damageDone then
         if u.damageDone.melee then dmgThreat = dmgThreat + (u.damageDone.melee.total or 0) end
         if u.damageDone.offhand then dmgThreat = dmgThreat + (u.damageDone.offhand.total or 0) end
+        if u.damageDone.petMelee then petThreat = petThreat + (u.damageDone.petMelee.total or 0) end
+        if u.damageDone.petOffhand then petThreat = petThreat + (u.damageDone.petOffhand.total or 0) end
     end
 
     local healThreat = 0
@@ -165,7 +185,7 @@ local function EstimateUnitThreat(u)
         healThreat = (u.healingDone.total or 0) * 0.5
     end
 
-    return (dmgThreat + healThreat) * mod
+    return (dmgThreat + healThreat) * mod, petThreat
 end
 
 -- Populates current/tankGuid from CombatLedger's own live encounter
@@ -187,11 +207,28 @@ local function EstimateThreat()
     local rawMax = 0
     local guid, u
     for guid, u in pairs(enc.units) do
-        local threat = EstimateUnitThreat(u)
+        local threat, petThreat = EstimateUnitThreat(u)
         local taunted = recentTaunts[guid] and (now - recentTaunts[guid]) < TAUNT_BOOST_DURATION
         if threat > 0 or taunted then
             raw[guid] = { name = u.name or guid, threat = threat, taunted = taunted }
             if threat > rawMax then rawMax = threat end
+        end
+        if petThreat > 0 then
+            -- Own slot, own key - never merged into the owner's entry
+            -- above. Keyed by the pet's real guid when the roster scan
+            -- currently has one on file (CL.GuidCache.Resolve then gives
+            -- it a real name/class like any other unit), falling back to
+            -- a synthetic key + "OwnerName's Pet" when it doesn't (pet
+            -- dismissed/out of range right now, but it still dealt
+            -- damage earlier this fight). Never taunt-boosted - taunts
+            -- are recorded by casterGuid and a pet's own Growl isn't a
+            -- tracked taunt source here, out of scope for this split.
+            local petGuid = CL.GuidCache and CL.GuidCache.GetPetGuid and CL.GuidCache.GetPetGuid(guid)
+            local petInfo = petGuid and CL.GuidCache.Resolve(petGuid)
+            local petKey = petGuid or ("PET:" .. guid)
+            local petName = (petInfo and petInfo.name) or ((u.name or guid) .. "'s Pet")
+            raw[petKey] = { name = petName, threat = petThreat, taunted = false }
+            if petThreat > rawMax then rawMax = petThreat end
         end
     end
     if not next(raw) then return false end
@@ -267,18 +304,30 @@ local function AddRosterName(unit)
     end
 end
 
+-- Also scans pet tokens (GuidCache.lua's own convention: "pet",
+-- "partypetN", "raidNpet") - not because the real TWT protocol is known
+-- to ever name a pet as its own entry (this file's header comment
+-- already confirms it only ever names party/raid members), but so that
+-- IF a server-side variant ever does, that name resolves to a real guid
+-- here instead of falling back to HandleThreatPacket's synthetic
+-- "THREATNAME:" key. Also makes pet names available in GetRosterNames'
+-- Threat filter dropdown for free, so a filtered view doesn't silently
+-- drop the split-out pet row from EstimateThreat above.
 local function RefreshRosterNames()
     nameToGuid = {}
     AddRosterName("player")
+    AddRosterName("pet")
     if GetNumRaidMembers and GetNumRaidMembers() > 0 then
         local i
         for i = 1, 40 do
             AddRosterName("raid" .. i)
+            AddRosterName("raid" .. i .. "pet")
         end
     elseif GetNumPartyMembers and GetNumPartyMembers() > 0 then
         local i
         for i = 1, 4 do
             AddRosterName("party" .. i)
+            AddRosterName("partypet" .. i)
         end
     end
 end
